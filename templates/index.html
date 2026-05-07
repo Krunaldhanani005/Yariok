@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YaariOK Smart System — Dashboard</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+
+<!-- ═══════════ HEADER ═══════════ -->
+<header>
+  <div>
+    <span class="logo">YAARIOK<span class="logo-sub"> SMART SYSTEM v3.0</span></span>
+  </div>
+  <div class="h-pills">
+    <div class="pill"><div class="dot dot-b" id="cam-dot"></div><span id="cam-txt">CONNECTING</span></div>
+    <div class="pill"><div class="dot dot-p"></div><span id="ai-pill">YOLOv8</span></div>
+    <div class="pill"><div class="dot dot-g"></div><span>Claude Sonnet</span></div>
+  </div>
+  <div class="h-mode" id="h-mode" style="background:rgba(5,150,105,.12);color:var(--green);border:1px solid var(--green)">✓ NORMAL MODE</div>
+  <div id="clock">--:--:--</div>
+</header>
+
+<!-- ═══════════ MAIN LAYOUT ═══════════ -->
+<div class="layout">
+
+  <!-- ══ LEFT: CAMERA FEED ══ -->
+  <div class="cam-wrap" id="cam-wrap">
+    <div id="cam-placeholder" style="color:var(--muted);font-size:18px;text-transform:uppercase;letter-spacing:2px">System Not Started</div>
+    <img id="cam-img" src="" alt="Live Camera" style="display:none">
+
+    <div class="hud-tl">
+      <div class="live-tag"><div class="live-dot"></div>LIVE</div>
+      <div class="mode-tag" id="mode-tag" style="background:rgba(16,185,129,.8)">✓ NORMAL</div>
+    </div>
+    <div class="hud-br">
+      <div class="cam-time" id="cam-time">—</div>
+    </div>
+  </div>
+
+  <!-- ══ RIGHT: SIDEBAR ══ -->
+  <div class="sidebar">
+
+    <!-- ─── 1. AI ROBOT VOICE ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">🤖</span>AI Robot Voice</div>
+      <div class="robot-card">
+        <div class="robot-row">
+          <div class="robot-avatar" id="r-avatar">🤖</div>
+          <div class="robot-info">
+            <div class="robot-state" id="r-state">STANDBY</div>
+            <div class="robot-speech" id="r-speech">System online</div>
+          </div>
+          <div class="mic-bars" id="mic-bars">
+            <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+            <div class="bar"></div><div class="bar"></div>
+          </div>
+        </div>
+        <div class="voice-meta">
+          <span class="vm-label">Listening:</span>
+          <span class="vm-val" id="v-listen-status">—</span>
+        </div>
+        <div class="voice-meta">
+          <span class="vm-label">Last Command:</span>
+          <span class="vm-val" id="v-last-cmd" style="color:var(--cyan)">—</span>
+        </div>
+        <div class="cmd-row">
+          <input class="cmd-input" id="cmd-in" placeholder="Type command..." />
+          <button class="cmd-send" onclick="sendText()">→</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── 2. SYSTEM CONTROL ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">⚙</span>System Control</div>
+      <div class="sb-grid">
+        <button class="sb-btn sb-btn-full" id="btn-sys-toggle" onclick="toggleSys()">
+          <span class="bi" id="sys-icon">▶</span>
+          <span id="sys-text">START SYSTEM</span>
+        </button>
+        <button class="sb-btn sb-btn-full" id="btn-voice-toggle" onclick="toggleVoice()">
+          <span class="bi" id="voice-icon">🎙</span>
+          <span id="voice-text">VOICE ON</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ─── 3. MODE CONTROL ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">🎯</span>Mode Control</div>
+      <div class="mode-grid">
+        <button class="mbtn" id="m-n" onclick="setMode('normal')"><span class="mi">✓</span>NORMAL</button>
+        <button class="mbtn" id="m-s" onclick="setMode('security')"><span class="mi">🔒</span>SECURITY</button>
+        <button class="mbtn" id="m-k" onclick="setMode('karaoke')"><span class="mi">🎤</span>KARAOKE</button>
+      </div>
+    </div>
+
+    <!-- ─── 4. CAMERA CONTROL ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">📸</span>Camera Control</div>
+      <div class="sb-grid-2">
+        <button class="sb-btn" onclick="takeSnapshot(this)"><span class="bi">📸</span>SNAPSHOT</button>
+        <button class="sb-btn" onclick="resetStats(this)"><span class="bi">↺</span>RESET STATS</button>
+      </div>
+    </div>
+
+    <!-- ─── 5. DASHBOARD NAVIGATION ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">🗂</span>Dashboard Navigation</div>
+      <div class="sb-grid">
+        <button class="sb-btn nav-btn" onclick="window.open('/snapshots','_blank')">
+          <span class="bi">📷</span>Snapshots Dashboard
+        </button>
+        <button class="sb-btn nav-btn" onclick="window.open('/alerts','_blank')">
+          <span class="bi">🚨</span>Alerts Dashboard
+        </button>
+        <button class="sb-btn nav-btn" onclick="window.open('/logs','_blank')">
+          <span class="bi">📋</span>Logs Dashboard
+        </button>
+      </div>
+    </div>
+
+    <!-- ─── 6. LIVE STATS ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">📊</span>Live Stats</div>
+      <div class="stats-grid">
+        <div class="stat"><div class="stat-n" id="s-ppl" style="color:var(--green)">0</div><div class="stat-l">People Now</div></div>
+        <div class="stat"><div class="stat-n" id="s-vis" style="color:var(--amber)">0</div><div class="stat-l">Visitors Today</div></div>
+        <div class="stat"><div class="stat-n" id="s-alt" style="color:var(--red)">0</div><div class="stat-l">Alerts Today</div></div>
+        <div class="stat"><div class="stat-n" id="s-snp" style="color:var(--blue)">0</div><div class="stat-l">Snapshots</div></div>
+      </div>
+    </div>
+
+    <!-- ─── 7. SYSTEM STATUS ─── -->
+    <div class="sb-section">
+      <div class="sb-title"><span class="sb-icon">📡</span>System Status</div>
+      <div class="sys-status">
+        <div>System Running: <span id="st-sys" style="color:var(--muted)">Stopped</span></div>
+        <div>Camera Status: <span id="st-cam" style="color:var(--muted)">Off</span></div>
+        <div>Voice Status: <span id="st-voice" style="color:var(--muted)">Off</span></div>
+        <div>Detection: <span id="st-det" style="color:var(--muted)">Inactive</span></div>
+        <div>Current Mode: <span id="st-mode" style="color:var(--green)">Normal</span></div>
+      </div>
+      <div class="chip-row" style="margin-top:6px">
+        <span class="chip chip-g" id="chip-cam">CAM —</span>
+        <span class="chip chip-y" id="chip-snp">📸 0</span>
+      </div>
+    </div>
+
+    <!-- ─── Last Visitor (shown when available) ─── -->
+    <div class="sb-section" id="visitor-sec" style="display:none">
+      <div class="sb-title" style="justify-content:space-between">
+        <span>Last Visitor</span>
+        <span style="font-size:8px;padding:2px 6px;border-radius:4px;background:rgba(6,182,212,.15);color:var(--cyan)">CLAUDE VISION</span>
+      </div>
+      <div class="vis-card">
+        <img id="vis-img" src="" alt="visitor" style="cursor:pointer" onclick="openImgModal(this.src)" title="Click to enlarge">
+        <div class="vis-speech" id="vis-speech"></div>
+      </div>
+    </div>
+
+    <!-- ─── AI Security Alert (security mode only) ─── -->
+    <div class="sb-section" id="ai-alert-sec" style="display:none">
+      <div class="sb-title" style="color:var(--red)">AI Security Analysis</div>
+      <div class="ai-alert-box" id="ai-alert-txt">—</div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- ══ BOTTOM: LOG PANELS ══ -->
+  <div class="log-bar">
+    <div class="log-panel">
+      <div class="log-hdr"><span>Activity Log</span><span id="log-count">loading…</span></div>
+      <div class="log-body" id="log-body"></div>
+    </div>
+    <div class="log-panel">
+      <div class="log-hdr"><span>System Log</span><span id="syslog-count">—</span></div>
+      <div class="log-body" id="syslog-body">
+        <div class="log-row"><span class="log-ts">--:--</span><span class="log-msg" style="color:var(--muted)">System logs appear here</span></div>
+      </div>
+    </div>
+    <div class="log-panel">
+      <div class="log-hdr"><span>Visitor Log</span><span id="vislog-count">—</span></div>
+      <div class="log-body" id="vislog-body">
+        <div class="log-row"><span class="log-ts">--:--</span><span class="log-msg" style="color:var(--muted)">Visitor entries appear here</span></div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /layout -->
+
+<!-- Live Alert Popup -->
+<div class="alert-popup" id="live-alert-popup">
+  <div class="alert-popup-title">🚨 ALERT DETECTED</div>
+  <div class="alert-popup-time" id="live-alert-time"></div>
+  <img id="live-alert-img" src="" style="cursor:pointer" onclick="openImgModal(this.src)" title="Click to enlarge">
+</div>
+
+<style>
+.sb-btn-full { width: 100%; }
+.nav-btn { justify-content: flex-start; padding-left: 12px; }
+.voice-meta {
+  display: flex; gap: 6px; align-items: baseline;
+  font-size: 9px; color: var(--muted); margin-top: 2px;
+}
+.vm-label { flex-shrink: 0; }
+.vm-val { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+
+<script>
+/* ── Clock ──────────────────────────────────────────────────────────────────── */
+function tick() {
+  const n = new Date();
+  document.getElementById('clock').textContent =
+    n.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  document.getElementById('cam-time').textContent =
+    n.toLocaleDateString('en-IN') + ' · ' +
+    n.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+setInterval(tick, 1000); tick();
+
+/* ── System / Voice toggles ─────────────────────────────────────────────────── */
+async function toggleSys() {
+  const isRun = document.getElementById('st-sys').textContent === 'Running';
+  await fetch('/api/system/' + (isRun ? 'stop' : 'start'), { method: 'POST' });
+  refresh();
+}
+
+async function toggleVoice() {
+  await fetch('/api/voice/toggle', { method: 'POST' });
+  refresh();
+}
+
+/* ── Mode control ────────────────────────────────────────────────────────────── */
+async function setMode(mode) {
+  await fetch('/api/mode/' + mode, { method: 'POST' });
+  refresh();
+}
+
+/* ── Camera control ──────────────────────────────────────────────────────────── */
+async function takeSnapshot(btn) {
+  if (btn) { btn.classList.add('flash-ok'); setTimeout(() => btn.classList.remove('flash-ok'), 600); }
+  await fetch('/api/camera/snapshot', { method: 'POST' });
+  refresh();
+}
+
+async function resetStats(btn) {
+  if (!confirm('Reset all stats and logs?')) return;
+  if (btn) { btn.classList.add('flash-ok'); setTimeout(() => btn.classList.remove('flash-ok'), 600); }
+  await fetch('/api/reset/stats', { method: 'POST' });
+  sysLogEntries = []; visLogEntries = [];
+  document.getElementById('syslog-body').innerHTML = '';
+  document.getElementById('vislog-body').innerHTML = '';
+  refresh();
+}
+
+/* ── Text command ─────────────────────────────────────────────────────────────── */
+async function sendText() {
+  const inp = document.getElementById('cmd-in');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  const btn = document.querySelector('.cmd-send');
+  btn.textContent = '✓';
+  setTimeout(() => btn.textContent = '→', 1000);
+  try {
+    await fetch('/api/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: '__text__', text})
+    });
+  } catch(_) {}
+}
+document.getElementById('cmd-in').addEventListener('keydown', e => {
+  if (e.key === 'Enter') sendText();
+});
+
+/* ── Robot state ─────────────────────────────────────────────────────────────── */
+let _prevSnap = 0;
+function applyRobot(d) {
+  const rs    = (d.robot_status || '').toLowerCase();
+  const speech = d.robot_speech || '';
+  const av = document.getElementById('r-avatar');
+  const st = document.getElementById('r-state');
+  const sp = document.getElementById('r-speech');
+  const mb = document.getElementById('mic-bars');
+
+  if (rs.includes('speaking')) {
+    av.textContent = '🔊'; av.className = 'robot-avatar speaking';
+    st.textContent = 'SPEAKING'; st.style.color = 'var(--cyan)';
+    mb.className = 'mic-bars speaking';
+  } else if (rs.includes('command')) {
+    av.textContent = '🎙'; av.className = 'robot-avatar listening';
+    st.textContent = 'LISTENING — COMMAND'; st.style.color = 'var(--green)';
+    mb.className = 'mic-bars listening';
+  } else if (rs.includes('wake') || rs.includes('waiting')) {
+    av.textContent = '🤖'; av.className = 'robot-avatar';
+    st.textContent = 'WAITING FOR WAKE WORD'; st.style.color = 'var(--muted)';
+    mb.className = 'mic-bars';
+  } else {
+    av.textContent = '🤖'; av.className = 'robot-avatar';
+    st.textContent = (rs || 'standby').toUpperCase(); st.style.color = 'var(--muted)';
+    mb.className = 'mic-bars';
+  }
+
+  if (speech && speech !== sp.textContent) {
+    sp.textContent = speech;
+    sp.style.color = 'var(--cyan)';
+    setTimeout(() => sp.style.color = 'var(--text)', 2000);
+  }
+
+  // Listening status label
+  const voiceRun = d.voice_running || false;
+  document.getElementById('v-listen-status').textContent = voiceRun ? 'Active' : 'Off';
+  document.getElementById('v-listen-status').style.color = voiceRun ? 'var(--green)' : 'var(--muted)';
+
+  // Last command
+  const lc = d.last_command || '—';
+  document.getElementById('v-last-cmd').textContent = lc.length > 30 ? lc.slice(0, 30) + '…' : lc;
+
+  const snp = d.snapshots_taken || 0;
+  if (snp > _prevSnap && _prevSnap > 0) {
+    document.getElementById('cam-wrap').classList.add('flash');
+    setTimeout(() => document.getElementById('cam-wrap').classList.remove('flash'), 1800);
+  }
+  _prevSnap = snp;
+}
+
+// JS log tracking removed in favor of DB logs
+
+/* ── Status refresh ─────────────────────────────────────────────────────────── */
+let _prevVis      = 0;
+let _prevSysState  = null;
+let _prevVoiceState = null;
+let lastAlertTime  = '';
+
+async function refresh() {
+  try {
+    const d = await fetch('/api/status').then(r => r.json());
+
+    const sysRun   = d.system_running  || false;
+    const voiceRun = d.voice_running   || false;
+    const isS      = !!d.security_mode;
+    const isK      = !!d.karaoke_mode;
+
+    // Track changes for system log
+    if (_prevSysState !== null && _prevSysState !== sysRun) {}
+    _prevSysState = sysRun;
+
+    if (_prevVoiceState !== null && _prevVoiceState !== voiceRun) {}
+    _prevVoiceState = voiceRun;
+
+    // System Status panel
+    document.getElementById('st-sys').textContent  = sysRun   ? 'Running'  : 'Stopped';
+    document.getElementById('st-sys').style.color  = sysRun   ? 'var(--green)' : 'var(--muted)';
+    document.getElementById('st-cam').textContent  = sysRun   ? (d.camera_status || 'On') : 'Off';
+    document.getElementById('st-cam').style.color  = sysRun   ? 'var(--green)' : 'var(--muted)';
+    document.getElementById('st-det').textContent  = sysRun   ? 'Active'   : 'Inactive';
+    document.getElementById('st-det').style.color  = sysRun   ? 'var(--green)' : 'var(--muted)';
+    document.getElementById('st-voice').textContent = voiceRun ? 'On'      : 'Off';
+    document.getElementById('st-voice').style.color = voiceRun ? 'var(--green)' : 'var(--muted)';
+
+    const modeLabel = isS ? 'Security' : (isK ? 'Karaoke' : 'Normal');
+    const modeColor = isS ? 'var(--red)' : (isK ? 'var(--amber)' : 'var(--green)');
+    document.getElementById('st-mode').textContent  = modeLabel;
+    document.getElementById('st-mode').style.color  = modeColor;
+
+    // Live alerts popup
+    if (d.last_live_alert_time && d.last_live_alert_time !== lastAlertTime) {
+      lastAlertTime = d.last_live_alert_time;
+      document.getElementById('live-alert-time').textContent = d.last_live_alert_time;
+      document.getElementById('live-alert-img').src = '/alerts/' + d.last_live_alert;
+      document.getElementById('live-alert-popup').style.display = 'block';
+      setTimeout(() => { document.getElementById('live-alert-popup').style.display = 'none'; }, 8000);
+    }
+
+    // Camera feed toggle
+    const camImg   = document.getElementById('cam-img');
+    const camPlace = document.getElementById('cam-placeholder');
+    if (sysRun) {
+      if (camImg.style.display === 'none') {
+        camImg.src = '/video_feed';
+        camImg.style.display = 'block';
+        camPlace.style.display = 'none';
+      }
+    } else {
+      camImg.style.display = 'none';
+      camImg.src = '';
+      camPlace.style.display = 'block';
+    }
+
+    // START / STOP button
+    const sysBtn = document.getElementById('btn-sys-toggle');
+    if (sysBtn) {
+      sysBtn.style.borderColor = sysRun ? 'var(--red)' : 'var(--green)';
+      sysBtn.style.color       = sysRun ? 'var(--red)' : 'var(--green)';
+      document.getElementById('sys-icon').textContent = sysRun ? '⏹' : '▶';
+      document.getElementById('sys-text').textContent = sysRun ? 'STOP SYSTEM' : 'START SYSTEM';
+    }
+
+    // VOICE toggle button
+    const voiceBtn = document.getElementById('btn-voice-toggle');
+    if (voiceBtn) {
+      voiceBtn.style.borderColor = voiceRun ? 'var(--red)' : 'var(--green)';
+      voiceBtn.style.color       = voiceRun ? 'var(--red)' : 'var(--green)';
+      document.getElementById('voice-icon').textContent = voiceRun ? '🔇' : '🎙';
+      document.getElementById('voice-text').textContent = voiceRun ? 'VOICE OFF' : 'VOICE ON';
+    }
+
+    // Live Stats
+    document.getElementById('s-ppl').textContent = d.people_now     ?? 0;
+    document.getElementById('s-vis').textContent = d.visitors_today ?? 0;
+    document.getElementById('s-alt').textContent = d.alerts_today   ?? 0;
+    document.getElementById('s-snp').textContent = d.snapshots_taken ?? 0;
+    document.getElementById('chip-snp').textContent = '📸 ' + (d.snapshots_taken ?? 0);
+
+    // Visitor arrival flash + log
+    const vis = d.visitors_today || 0;
+    if (vis > _prevVis && _prevVis > 0) {
+      document.getElementById('cam-wrap').classList.add('flash');
+      setTimeout(() => document.getElementById('cam-wrap').classList.remove('flash'), 1800);
+    }
+    _prevVis = vis;
+
+    // Camera dot + chip
+    const cam = d.camera_status || '—';
+    document.getElementById('cam-txt').textContent = cam;
+    document.getElementById('chip-cam').textContent = 'CAM: ' + cam;
+    const dot = document.getElementById('cam-dot');
+    if (cam === 'LIVE')          dot.className = 'dot dot-g';
+    else if (cam === 'RECONNECTING') dot.className = 'dot dot-y';
+    else                         dot.className = 'dot dot-r';
+
+    // Robot / voice
+    applyRobot(d);
+
+    // Mode buttons
+    document.getElementById('m-n').className = 'mbtn' + (!isS && !isK ? ' active-n' : '');
+    document.getElementById('m-s').className = 'mbtn' + (isS           ? ' active-s' : '');
+    document.getElementById('m-k').className = 'mbtn' + (isK           ? ' active-k' : '');
+
+    // Header mode badge + cam-wrap class
+    const tag = document.getElementById('mode-tag');
+    const hm  = document.getElementById('h-mode');
+    const wrap = document.getElementById('cam-wrap');
+    if (isS) {
+      tag.textContent = '🔒 SECURITY'; tag.style.background = 'rgba(220,38,38,.9)';
+      hm.style.cssText = 'background:rgba(220,38,38,.1);color:var(--red);border:1px solid var(--red)';
+      hm.textContent = '🔒 SECURITY MODE';
+      wrap.className = 'cam-wrap sec';
+    } else if (isK) {
+      tag.textContent = '🎤 KARAOKE'; tag.style.background = 'rgba(215,119,6,.88)';
+      hm.style.cssText = 'background:rgba(215,119,6,.1);color:var(--amber);border:1px solid var(--amber)';
+      hm.textContent = '🎤 KARAOKE MODE';
+      wrap.className = 'cam-wrap kar';
+    } else {
+      tag.textContent = '✓ NORMAL'; tag.style.background = 'rgba(5,150,105,.85)';
+      hm.style.cssText = 'background:rgba(5,150,105,.12);color:var(--green);border:1px solid var(--green)';
+      hm.textContent = '✓ NORMAL MODE';
+      wrap.className = 'cam-wrap';
+    }
+
+    // Last visitor Claude Vision thumbnail
+    const b64 = d.last_visitor_b64 || '';
+    if (b64) {
+      document.getElementById('vis-img').src = 'data:image/jpeg;base64,' + b64;
+      document.getElementById('vis-speech').textContent = d.robot_speech || '';
+      document.getElementById('visitor-sec').style.display = 'block';
+    }
+
+    // AI Security alert
+    const aiTxt = d.ai_alert || '';
+    const aiSec = document.getElementById('ai-alert-sec');
+    if (isS && aiTxt) {
+      document.getElementById('ai-alert-txt').textContent = aiTxt;
+      aiSec.style.display = 'block';
+    } else {
+      aiSec.style.display = 'none';
+    }
+
+  } catch(_) {}
+}
+
+/* ── Activity log ─────────────────────────────────────────────────────────────── */
+async function refreshLog() {
+  try {
+    const res = await fetch('/api/logs').then(r => r.json());
+    
+    // Find today's date in local time
+    const tZoffset = (new Date()).getTimezoneOffset() * 60000;
+    const today = (new Date(Date.now() - tZoffset)).toISOString().slice(0, 10);
+    const d = res.grouped[today] || {"voice": [], "visitor": [], "alert": [], "system": []};
+
+    const fmt = arr => arr.slice(0, 30).map(l => {
+      const ts = l.timestamp ? l.timestamp.split(" ")[1] : "";
+      return `<div class="log-row"><span class="log-ts">${ts}</span><span class="log-msg">${l.message}</span></div>`;
+    }).join('');
+
+    const acts = [...(d.voice || []), ...(d.activity || []), ...(d.system || [])].sort((a,b) => b.id - a.id);
+    document.getElementById('log-count').textContent = acts.length + ' entries';
+    document.getElementById('log-body').innerHTML = fmt(acts);
+
+    const sys = [...(d.system || []), ...(d.alert || [])].sort((a,b) => b.id - a.id);
+    document.getElementById('syslog-count').textContent = sys.length + ' entries';
+    document.getElementById('syslog-body').innerHTML = fmt(sys);
+
+    const vis = d.visitor || [];
+    document.getElementById('vislog-count').textContent = vis.length + ' entries';
+    document.getElementById('vislog-body').innerHTML = fmt(vis);
+
+  } catch(_) {}
+}
+
+setInterval(refresh,    800);
+setInterval(refreshLog, 2500);
+refresh(); refreshLog();
+</script>
+
+<!-- ═══════════ IMAGE PREVIEW MODAL ═══════════ -->
+<div id="img-modal" style="display:none;position:fixed;inset:0;z-index:10000;
+     background:rgba(0,0,0,.88);align-items:center;justify-content:center;flex-direction:column"
+     onclick="closeImgModal()">
+  <img id="img-modal-src" style="max-width:90vw;max-height:85vh;object-fit:contain;
+       border-radius:8px;box-shadow:0 24px 60px rgba(0,0,0,.6)" onclick="event.stopPropagation()">
+  <button style="position:fixed;top:18px;right:28px;background:rgba(255,255,255,.15);
+          border:1px solid rgba(255,255,255,.3);color:#fff;font-size:28px;line-height:1;
+          width:44px;height:44px;border-radius:50%;cursor:pointer;
+          display:flex;align-items:center;justify-content:center"
+          onclick="closeImgModal()">✕</button>
+</div>
+
+<script>
+function openImgModal(src) {
+  if (!src) return;
+  document.getElementById('img-modal-src').src = src;
+  document.getElementById('img-modal').style.display = 'flex';
+}
+function closeImgModal() {
+  document.getElementById('img-modal').style.display = 'none';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeImgModal(); });
+</script>
+
+</body>
+</html>

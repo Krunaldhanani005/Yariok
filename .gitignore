@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.env/
+
+# Environment Variables
+.env
+
+# Secrets
+keys.py
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# AI Models
+*.pt
+*.onnx
+
+# Snapshots / Media
+snapshots/
+alerts/
+recordings/
+temp/
+cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+
+# Node
+node_modules/
+
+# React
+.next/
+
+# Misc
+*.tmp
+*.bak

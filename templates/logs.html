@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yaariok — Logs</title>
+<style>
+:root {
+  --bg:      #f0f4f8;
+  --panel:   #ffffff;
+  --card:    #f8fafc;
+  --border:  #e2e8f0;
+  --border2: #cbd5e1;
+  --text:    #1e293b;
+  --muted:   #64748b;
+  --green:   #059669;
+  --red:     #dc2626;
+  --amber:   #d97706;
+  --blue:    #2563eb;
+  --cyan:    #0891b2;
+  --purple:  #7c3aed;
+}
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0 }
+body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; }
+
+.navbar {
+  background:var(--panel); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:0; padding:0 20px; height:56px;
+}
+.nav-logo { font-size:14px; font-weight:800; letter-spacing:2px;
+  background:linear-gradient(135deg,#fff,var(--purple));
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+  margin-right:20px;
+}
+.nav-link {
+  color:var(--muted); text-decoration:none; font-size:11px; font-weight:700;
+  text-transform:uppercase; letter-spacing:1px; padding:0 14px; height:56px;
+  display:flex; align-items:center; border-bottom:2px solid transparent;
+  transition:color .2s, border-color .2s;
+}
+.nav-link:hover { color:var(--text); }
+.nav-link.active { color:var(--purple); border-bottom-color:var(--purple); }
+
+.container { padding:24px 28px; max-width:1200px; }
+
+.day-block { margin-bottom:40px; }
+
+.day-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:10px 0; border-bottom:1px solid var(--border);
+  margin-bottom:20px;
+}
+.day-title { font-size:17px; font-weight:700; color:var(--purple); }
+.day-counts {
+  display:flex; gap:14px; font-size:10px; font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px;
+}
+.dc { display:flex; align-items:center; gap:5px; color:var(--muted); }
+.dc-n { font-size:13px; }
+.dc.voice  .dc-n { color:var(--cyan); }
+.dc.visitor .dc-n { color:var(--green); }
+.dc.alert  .dc-n { color:var(--red); }
+
+.log-sections { display:flex; flex-direction:column; gap:16px; }
+
+.log-section {
+  background:var(--card); border:1px solid var(--border2);
+  border-radius:10px; overflow:hidden;
+}
+.log-section-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:10px 14px; border-bottom:1px solid var(--border);
+  cursor:pointer; user-select:none;
+}
+.log-section-title {
+  font-size:10px; font-weight:700; letter-spacing:1px;
+  text-transform:uppercase; display:flex; align-items:center; gap:7px;
+}
+.log-section-title.voice   { color:var(--cyan); }
+.log-section-title.visitor { color:var(--green); }
+.log-section-title.alert   { color:var(--red); }
+.log-count-badge {
+  font-size:9px; padding:2px 7px; border-radius:10px; font-weight:700;
+}
+.voice   .log-count-badge { background:rgba(6,182,212,.12);   color:var(--cyan); }
+.visitor .log-count-badge { background:rgba(16,185,129,.12);  color:var(--green); }
+.alert   .log-count-badge { background:rgba(239,68,68,.1);    color:var(--red); }
+
+.log-list { padding:0 14px; }
+.log-row {
+  display:flex; gap:12px; align-items:baseline;
+  padding:6px 0; border-bottom:1px solid rgba(26,37,64,.5);
+  font-size:11px; line-height:1.5;
+}
+.log-row:last-child { border-bottom:none; }
+.log-ts {
+  color:var(--muted); font-family:'Consolas',monospace;
+  white-space:nowrap; flex-shrink:0; font-size:10px; min-width:70px;
+}
+.log-type {
+  font-size:8px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+  padding:1px 5px; border-radius:3px; flex-shrink:0;
+}
+.log-msg { color:var(--text); flex:1; }
+
+.empty-section {
+  padding:16px 14px; font-size:11px; color:var(--muted); text-align:center;
+}
+.empty { color:var(--muted); font-size:14px; padding:40px 0; text-align:center; }
+
+.collapse-indicator { font-size:10px; color:var(--muted); }
+.collapsed .log-list { display:none; }
+</style>
+</head>
+<body>
+
+<div class="navbar">
+  <span class="nav-logo">YAARIOK</span>
+  <a href="/"          class="nav-link">Dashboard</a>
+  <a href="/snapshots" class="nav-link">Snapshots</a>
+  <a href="/alerts"    class="nav-link">Alerts</a>
+  <a href="/logs"      class="nav-link active">Logs</a>
+</div>
+
+<div class="container" id="content">
+  <div class="empty">Loading logs…</div>
+</div>
+
+<script>
+function friendlyDate(ds) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const yest  = new Date(today); yest.setDate(yest.getDate()-1);
+  const d     = new Date(ds);    d.setHours(0,0,0,0);
+  if (d.getTime() === today.getTime()) return 'Today';
+  if (d.getTime() === yest.getTime())  return 'Yesterday';
+  return ds;
+}
+
+function timeOf(ts) {
+  return ts ? ts.split(' ')[1] || ts : '—';
+}
+
+function makeLogRows(entries) {
+  if (!entries || !entries.length) {
+    return `<div class="empty-section">No entries.</div>`;
+  }
+  return `<div class="log-list">` +
+    entries.map(e => `
+      <div class="log-row">
+        <span class="log-ts">${timeOf(e.timestamp)}</span>
+        <span class="log-msg">${e.message || '—'}</span>
+      </div>`).join('') +
+    `</div>`;
+}
+
+function toggleSection(el) {
+  el.closest('.log-section').classList.toggle('collapsed');
+  const ind = el.querySelector('.collapse-indicator');
+  ind.textContent = el.closest('.log-section').classList.contains('collapsed') ? '▶' : '▼';
+}
+
+async function loadLogs() {
+  const res = await fetch('/api/logs').then(r => r.json());
+  const content = document.getElementById('content');
+  const entries = Object.entries(res.grouped || {});
+
+  if (!entries.length) {
+    content.innerHTML = '<div class="empty">No logs recorded yet.</div>';
+    return;
+  }
+
+  let html = '';
+  for (const [date, types] of entries) {
+    const voiceLogs   = types.voice   || [];
+    const visitorLogs = types.visitor || [];
+    const alertLogs   = types.alert   || [];
+    const total       = voiceLogs.length + visitorLogs.length + alertLogs.length;
+
+    html += `
+      <div class="day-block">
+        <div class="day-header">
+          <div class="day-title">${friendlyDate(date)}</div>
+          <div class="day-counts">
+            <div class="dc voice">   Voice:   <span class="dc-n">${voiceLogs.length}</span></div>
+            <div class="dc visitor"> Visitor: <span class="dc-n">${visitorLogs.length}</span></div>
+            <div class="dc alert">   Alert:   <span class="dc-n">${alertLogs.length}</span></div>
+          </div>
+        </div>
+
+        <div class="log-sections">
+
+          <div class="log-section">
+            <div class="log-section-header" onclick="toggleSection(this)">
+              <div class="log-section-title voice">
+                🎙 Voice Logs
+                <span class="log-count-badge">${voiceLogs.length}</span>
+              </div>
+              <span class="collapse-indicator">▼</span>
+            </div>
+            ${makeLogRows(voiceLogs)}
+          </div>
+
+          <div class="log-section">
+            <div class="log-section-header" onclick="toggleSection(this)">
+              <div class="log-section-title visitor">
+                👤 Visitor Logs
+                <span class="log-count-badge">${visitorLogs.length}</span>
+              </div>
+              <span class="collapse-indicator">▼</span>
+            </div>
+            ${makeLogRows(visitorLogs)}
+          </div>
+
+          <div class="log-section">
+            <div class="log-section-header" onclick="toggleSection(this)">
+              <div class="log-section-title alert">
+                🚨 Alert Logs
+                <span class="log-count-badge">${alertLogs.length}</span>
+              </div>
+              <span class="collapse-indicator">▼</span>
+            </div>
+            ${makeLogRows(alertLogs)}
+          </div>
+
+        </div>
+      </div>`;
+  }
+  content.innerHTML = html;
+}
+
+loadLogs();
+setInterval(loadLogs, 5000);
+</script>
+</body>
+</html>

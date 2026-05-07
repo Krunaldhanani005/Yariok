@@ -1,0 +1,51 @@
+[2026-05-06 13:50:39] Voice started
+[2026-05-06 13:52:00] Voice stopped
+[2026-05-06 13:52:38] Voice started
+[2026-05-06 13:53:18] System started
+[2026-05-06 13:53:25] Camera connected
+[2026-05-06 13:53:36] Security mode ON (Voice)
+[2026-05-06 13:53:40] Visitor #1 arrived
+[2026-05-06 13:53:56] Security mode ON (Voice)
+[2026-05-06 13:54:04] Karaoke mode ON (Voice)
+[2026-05-06 13:54:05] Visitor #2 arrived
+[2026-05-06 13:54:14] Manual snapshot taken from dashboard
+[2026-05-06 13:54:33] Normal mode (Voice)
+[2026-05-06 13:54:47] Google search: weather of ahmedabad
+[2026-05-06 13:55:24] Visitor #3 arrived
+[2026-05-06 13:56:24] Visitor #4 arrived
+[2026-05-06 13:56:38] YouTube: party song
+[2026-05-06 13:56:57] Visitor #5 arrived
+[2026-05-06 13:57:01] Visitor #6 arrived
+[2026-05-06 13:57:21] System stopped
+[2026-05-06 14:08:16] Voice started
+[2026-05-06 14:11:53] System started
+[2026-05-06 14:11:58] Camera connected
+[2026-05-06 14:12:32] Visitor #1 arrived
+[2026-05-06 14:12:49] Visitor #2 arrived
+[2026-05-06 14:13:16] Visitor #3 arrived
+[2026-05-06 14:18:28] Visitor #4 arrived
+[2026-05-06 14:18:32] Visitor #5 arrived
+[2026-05-06 14:19:18] Visitor #6 arrived
+[2026-05-06 14:19:33] Visitor #7 arrived
+[2026-05-06 14:19:37] Visitor #8 arrived
+[2026-05-06 14:20:51] System stopped
+[2026-05-06 14:20:52] Voice stopped
+[2026-05-06 14:23:31] Voice started
+[2026-05-06 14:35:14] Voice started
+[2026-05-06 14:35:18] Voice stopped
+[2026-05-06 14:38:46] Voice started
+[2026-05-06 14:39:12] System started
+[2026-05-06 14:39:18] Camera connected
+[2026-05-06 14:39:20] Visitor #1 arrived
+[2026-05-06 14:39:45] Manual snapshot taken from dashboard
+[2026-05-06 14:40:08] Security mode ON (Voice)
+[2026-05-06 14:40:14] Visitor #2 arrived
+[2026-05-06 14:40:50] Karaoke mode ON (Voice)
+[2026-05-06 14:41:37] YouTube: party welcome music upbeat
+[2026-05-06 14:42:15] YouTube: kesariya
+[2026-05-06 14:42:47] Normal mode (Voice)
+[2026-05-06 14:44:17] Visitor #3 arrived
+[2026-05-06 14:45:44] Visitor #4 arrived
+[2026-05-06 14:47:13] Visitor #5 arrived
+[2026-05-06 14:47:28] System stopped
+[2026-05-06 14:47:30] Voice stopped

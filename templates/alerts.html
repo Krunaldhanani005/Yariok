@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yaariok — Alerts</title>
+<style>
+:root {
+  --bg:      #f0f4f8;
+  --panel:   #ffffff;
+  --card:    #fff5f5;
+  --border:  #e2e8f0;
+  --border2: #fecaca;
+  --text:    #1e293b;
+  --muted:   #64748b;
+  --red:     #dc2626;
+  --amber:   #d97706;
+  --blue:    #2563eb;
+  --green:   #059669;
+}
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0 }
+body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; }
+
+.navbar {
+  background:var(--panel); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:0; padding:0 20px; height:56px;
+}
+.nav-logo { font-size:14px; font-weight:800; letter-spacing:2px;
+  background:linear-gradient(135deg,#7f1d1d,var(--red));
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+  margin-right:20px;
+}
+.nav-link {
+  color:var(--muted); text-decoration:none; font-size:11px; font-weight:700;
+  text-transform:uppercase; letter-spacing:1px; padding:0 14px; height:56px;
+  display:flex; align-items:center; border-bottom:2px solid transparent;
+  transition:color .2s, border-color .2s;
+}
+.nav-link:hover { color:var(--text); }
+.nav-link.active { color:var(--red); border-bottom-color:var(--red); }
+
+.container { padding:24px 28px; max-width:1400px; }
+
+.day-block { margin-bottom:36px; }
+.day-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:10px 0; border-bottom:1px solid rgba(239,68,68,.25);
+  margin-bottom:16px;
+}
+.day-title { font-size:17px; font-weight:700; color:var(--red); }
+.day-stats {
+  display:flex; gap:16px; font-size:10px; font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+}
+.day-stat-n { color:var(--text); font-size:13px; }
+
+.grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
+  gap:16px;
+}
+.card {
+  background:var(--card); border:1px solid var(--border2);
+  border-radius:12px; overflow:hidden;
+  box-shadow:0 4px 16px rgba(239,68,68,.06);
+  transition:border-color .2s, transform .2s;
+}
+.card:hover { border-color:var(--red); transform:translateY(-2px); }
+.card img {
+  width:100%; height:170px; object-fit:cover; display:block;
+  border-bottom:2px solid rgba(239,68,68,.4);
+}
+.card-body { padding:12px 14px; }
+.card-title { font-size:13px; font-weight:700; margin-bottom:4px; color:var(--text); }
+.card-sub { font-size:10px; color:var(--muted); margin-bottom:4px; }
+.card-status {
+  display:inline-block; font-size:9px; font-weight:700; letter-spacing:.5px;
+  padding:2px 7px; border-radius:4px;
+  background:rgba(239,68,68,.12); color:var(--red); border:1px solid rgba(239,68,68,.3);
+  margin-bottom:12px;
+}
+.actions { display:flex; gap:6px; }
+.btn {
+  flex:1; padding:7px 4px; border-radius:6px; border:1px solid var(--border2);
+  background:transparent; color:var(--text); font-size:11px; cursor:pointer;
+  text-align:center; text-decoration:none; transition:background .15s;
+}
+.btn:hover { background:rgba(255,255,255,.05); }
+.btn.danger { color:var(--red); border-color:rgba(239,68,68,.4); }
+.btn.danger:hover { background:rgba(239,68,68,.15); }
+
+.empty { color:var(--muted); font-size:14px; padding:40px 0; text-align:center; }
+
+.modal {
+  display: none; position: fixed; z-index: 1000; padding-top: 60px;
+  left: 0; top: 0; width: 100%; height: 100%; overflow: auto;
+  background-color: rgba(0,0,0,0.9);
+}
+.modal-content {
+  margin: auto; display: block; max-width: 90%; max-height: 85vh; object-fit: contain;
+  transition: transform 0.25s ease;
+}
+.modal-close {
+  position: absolute; top: 20px; right: 35px;
+  color: #fff; font-size: 40px; font-weight: bold; cursor: pointer;
+  z-index: 1001;
+}
+</style>
+</head>
+<body>
+
+<div class="navbar">
+  <span class="nav-logo">YAARIOK</span>
+  <a href="/"          class="nav-link">Dashboard</a>
+  <a href="/snapshots" class="nav-link">Snapshots</a>
+  <a href="/alerts"    class="nav-link active">Alerts</a>
+  <a href="/logs"      class="nav-link">Logs</a>
+</div>
+
+<div class="container" id="content">
+  <div class="empty">Loading alerts…</div>
+</div>
+
+<div id="imgModal" class="modal" onclick="closeModal()">
+  <span class="modal-close" onclick="closeModal()">&times;</span>
+  <img class="modal-content" id="modalImg" onclick="event.stopPropagation()">
+</div>
+
+<script>
+function friendlyDate(ds) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const yest  = new Date(today); yest.setDate(yest.getDate()-1);
+  const d     = new Date(ds);    d.setHours(0,0,0,0);
+  if (d.getTime() === today.getTime()) return 'Today';
+  if (d.getTime() === yest.getTime())  return 'Yesterday';
+  return ds;
+}
+
+async function loadAlerts() {
+  const res = await fetch('/api/alerts/daywise').then(r => r.json());
+  const content = document.getElementById('content');
+  const entries = Object.entries(res.grouped || {});
+
+  if (!entries.length) {
+    content.innerHTML = '<div class="empty">No alerts recorded.</div>';
+    return;
+  }
+
+  let html = '';
+  for (const [date, alerts] of entries) {
+    let totalPersons = 0;
+    alerts.forEach(a => {
+        totalPersons += a.person_count || 0;
+    });
+    
+    html += `
+      <div class="day-block">
+        <div class="day-header">
+          <div class="day-title">🚨 ${friendlyDate(date)}</div>
+          <div class="day-stats">
+            <span>Total Alerts: <span class="day-stat-n">${alerts.length}</span></span>
+            <span style="margin-left: 10px;">Persons detected: <span class="day-stat-n">${totalPersons}</span></span>
+          </div>
+        </div>
+        <div class="grid">
+          ${alerts.map(a => {
+            const ts     = a.timestamp || '';
+            const time   = ts.split(' ')[1] || ts;
+            const atype  = a.alert_type || 'Motion Detected';
+            const status = a.status     || 'Active';
+            return `
+              <div class="card">
+                <img src="/alerts/${a.image_path}" alt="${a.image_path}" style="cursor:pointer;"
+                     onerror="this.style.background='#200a10';this.src=''"
+                     onclick="openModal('/alerts/${a.image_path}')">
+                <div class="card-body">
+                  <div class="card-title">🚨 ${atype}</div>
+                  <div class="card-sub">${ts}</div>
+                  <div class="card-status">${status}</div>
+                  <div class="actions">
+                    <button class="btn" onclick="openModal('/alerts/${a.image_path}')">View</button>
+                    <a class="btn" href="/alerts/${a.image_path}" download>Download</a>
+                    <button class="btn danger" onclick="delAlert(${a.id})">Delete</button>
+                  </div>
+                </div>
+              </div>`;
+          }).join('')}
+        </div>
+      </div>`;
+  }
+  content.innerHTML = html;
+}
+
+async function delAlert(id) {
+  if (!confirm('Delete this alert record?')) return;
+  await fetch('/api/alert/' + id, { method: 'DELETE' });
+  loadAlerts();
+}
+
+loadAlerts();
+setInterval(loadAlerts, 5000);
+
+function openModal(src) {
+  document.getElementById("imgModal").style.display = "block";
+  document.getElementById("modalImg").src = src;
+}
+function closeModal() {
+  document.getElementById("imgModal").style.display = "none";
+}
+</script>
+</body>
+</html>
