@@ -1,13 +1,32 @@
-SpeechRecognition
-pyttsx3
-pyaudio
+# Yaariok Smart System — Python dependencies
+# Install: pip install -r requirements.txt
+# GPU (RTX 5050 / CUDA 12.8+):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Web framework
+flask
+
+# Environment / config
+python-dotenv
+
+# Computer vision
 opencv-python
 ultralytics
-requests
-plyer
-groq
+
+# Speech recognition
+SpeechRecognition
+pyaudio
+
+# Text-to-speech
 edge-tts
+pyttsx3
 pygame
-screen-brightness-control
-# GPU: RTX 5050 needs PyTorch with CUDA 12.8+ for Blackwell (sm_120) support
-# Install with: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# HTTP client (LLM API calls)
+requests
+
+# Numpy (vision processing)
+numpy
+
+# Desktop notifications
+plyer
