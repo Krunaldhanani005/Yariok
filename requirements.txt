@@ -3,30 +3,31 @@
 # GPU (RTX 5050 / CUDA 12.8+):
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Web framework
+# ── Web framework ──────────────────────────────────────────────────────
 flask
 
-# Environment / config
+# ── Environment / config ───────────────────────────────────────────────
 python-dotenv
 
-# Computer vision
+# ── Vision pipeline (Phase B) ──────────────────────────────────────────
 opencv-python
-ultralytics
+ultralytics            # YOLOv11 + BoT-SORT
+insightface            # ArcFace `buffalo_l` face embeddings
+onnxruntime            # InsightFace inference backend (use onnxruntime-gpu on CUDA hosts)
+faiss-cpu              # cosine search over 512-d face embeddings
+numpy
 
-# Speech recognition
+# ── MQTT event bus ─────────────────────────────────────────────────────
+paho-mqtt              # client used by VisionService + main.py
+amqtt                  # pure-Python broker for dev (replace with mosquitto in prod)
+
+# ── Speech / TTS ───────────────────────────────────────────────────────
 SpeechRecognition
 pyaudio
-
-# Text-to-speech
 edge-tts
 pyttsx3
 pygame
 
-# HTTP client (LLM API calls)
-requests
-
-# Numpy (vision processing)
-numpy
-
-# Desktop notifications
-plyer
+# ── Misc ───────────────────────────────────────────────────────────────
+requests               # OpenRouter LLM calls
+plyer                  # desktop notifications

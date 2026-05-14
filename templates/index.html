@@ -76,6 +76,12 @@
     <div class="sb-section">
       <div class="sb-title"><span class="sb-icon">⚙</span>System Control</div>
       <div class="sb-grid">
+        <button class="sb-btn sb-btn-full" id="btn-sys-firsttime" onclick="firstTimeStart(this)"
+                style="background:#3a1f1f; border-color:#5a2929; color:#ff9b9b"
+                title="Wipe snapshots, logs, counters, and identity cache, then start the system fresh.">
+          <span class="bi" id="ft-icon">🆕</span>
+          <span id="ft-text">START SYSTEM FIRST TIME</span>
+        </button>
         <button class="sb-btn sb-btn-full" id="btn-sys-toggle" onclick="toggleSys()">
           <span class="bi" id="sys-icon">▶</span>
           <span id="sys-text">START SYSTEM</span>
@@ -226,6 +232,46 @@ async function toggleSys() {
   const isRun = document.getElementById('st-sys').textContent === 'Running';
   await fetch('/api/system/' + (isRun ? 'stop' : 'start'), { method: 'POST' });
   refresh();
+}
+
+/* ── First-time wipe + start ─────────────────────────────────────────────────
+ * Calls /api/system/reset_all (which empties snapshots/logs/alerts/DB +
+ * the in-memory FAISS+body identity cache + daily_state.json), then issues
+ * a normal /api/system/start so the user lands on a clean, running system.
+ * Confirms first — this is destructive and not undo-able.
+ */
+async function firstTimeStart(btn) {
+  if (!confirm(
+        "FIRST-TIME START will:\n\n" +
+        " • delete all snapshot files\n" +
+        " • delete all alert files\n" +
+        " • clear snapshots/logs/alerts tables\n" +
+        " • reset visitor / snapshot / alert counters\n" +
+        " • wipe the in-memory face & body identity cache\n\n" +
+        "This cannot be undone. Continue?"
+      )) return;
+  const label = document.getElementById('ft-text');
+  const orig  = label.textContent;
+  btn.disabled = true;
+  label.textContent = 'WIPING…';
+  try {
+    const r = await fetch('/api/system/reset_all', { method: 'POST' });
+    const data = await r.json();
+    if (!data.ok) {
+      alert('Reset failed: ' + JSON.stringify(data));
+      return;
+    }
+    // After the wipe, start the system normally.
+    await fetch('/api/system/start', { method: 'POST' });
+    label.textContent = 'WIPED ✓';
+    const s = data.summary || {};
+    console.log('factory wipe summary', s);
+  } catch (e) {
+    alert('Reset error: ' + e);
+  } finally {
+    setTimeout(() => { label.textContent = orig; btn.disabled = false; refresh(); }, 1500);
+    refresh();
+  }
 }
 
 async function toggleVoice() {

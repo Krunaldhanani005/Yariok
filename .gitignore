@@ -54,3 +54,9 @@ node_modules/
 # Misc
 *.tmp
 *.bak
+
+# App-specific logs and stores
+visitor_log.txt
+daily_identity.pkl
+daily_state.json
+*.pkl

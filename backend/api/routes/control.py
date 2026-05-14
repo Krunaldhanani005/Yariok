@@ -1,7 +1,6 @@
 """Control routes — system, voice, mode, camera, video feed, and main page."""
 
 import datetime
-import time
 
 import cv2
 import numpy as np
@@ -39,37 +38,29 @@ def _make_placeholder() -> np.ndarray:
 
 @bp.route("/video_feed")
 def video_feed():
-    # Capture the vision service reference HERE inside the request context,
-    # then pass it into the generator as a closure. Calling current_app inside
-    # the while-True loop of a streaming generator is unreliable in Flask.
+    # Phase B: stream comes from the new VisionService's bounded queue.
+    # vision.get_video_feed() yields already-multipart-encoded chunks
+    # (boundary + JPEG bytes). We must NOT poll get_annotated_frame()
+    # any more — that method belonged to the legacy camera_service.
     reg = current_app.config["registry"]
+    vision = reg.get("vision")
     placeholder = _make_placeholder()
 
     def _generator():
-        last_id = None
-        while True:
-            vision = reg.get("vision")
-            frame = vision.get_annotated_frame() if vision else None
-
-            if frame is None:
-                # Show a loading screen instead of a blank / broken image
-                frame = placeholder
-                time.sleep(0.5)
-
-            fid = id(frame)
-            if fid == last_id:
-                time.sleep(0.008)
-                continue
-            last_id = fid
-
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if vision is None:
+            # Vision service not registered — serve a single placeholder so the
+            # <img> tag doesn't show a broken icon. Browser will retry.
+            ok, buf = cv2.imencode(".jpg", placeholder, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + buf.tobytes()
-                    + b"\r\n"
+                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                    + buf.tobytes() + b"\r\n"
                 )
+            return
+        # Delegate directly to the VisionService generator. It already
+        # produces "--frame\r\nContent-Type: image/jpeg\r\n\r\n<bytes>\r\n"
+        # framing and respects the bounded queue (maxsize=5, drop-oldest).
+        yield from vision.get_video_feed()
 
     return Response(
         _generator(),
@@ -248,6 +239,118 @@ def api_camera_snapshot():
     if automation:
         automation.take_snapshot()
     return jsonify({"ok": True})
+
+
+# ── First-time wipe (dashboard "START SYSTEM FIRST TIME" button) ─────────────────
+
+@bp.route("/api/system/reset_all", methods=["POST"])
+def api_system_reset_all():
+    """Wipe ALL persisted + in-memory state so the system behaves as a
+    brand-new install. Used by the "Start System First Time" button on
+    the dashboard for repeated testing.
+
+    Wipe order is deliberate:
+      1. Vision identity cache FIRST — so any in-flight face job that
+         finishes mid-wipe sees an empty FAISS index and treats every
+         track as new.
+      2. StateManager counters — resets the on-disk daily_state.json too.
+      3. SQLite tables — snapshots / logs / alerts.
+      4. Files on disk — JPEGs in snapshots/ and alerts/, visitor_log.txt.
+      5. (Optionally) start the system afterwards via the existing route.
+
+    NOT safe in production: there is no auth, and a concurrent vision
+    event may write a row that survives the wipe by milliseconds.
+    """
+    import glob
+    import os
+    import sqlite3
+    from backend.config.settings import ALERTS_DIR, DB_PATH, LOG_FILE, SNAPSHOT_DIR
+
+    reg = _registry()
+    summary = {
+        "vision_cache": False,
+        "state_counters": False,
+        "db_rows_deleted": 0,
+        "snapshot_files_deleted": 0,
+        "alert_files_deleted": 0,
+        "visitor_log_deleted": False,
+    }
+
+    # 1) In-memory identity (FAISS index, body library, known_bot_sort_ids).
+    vision = reg.get("vision")
+    if vision is not None:
+        try:
+            vision.factory_reset()
+            summary["vision_cache"] = True
+        except Exception:
+            current_app.logger.exception("vision.factory_reset failed")
+
+    # 2) StateManager + daily_state.json.
+    state = reg.get("state")
+    if state is not None:
+        try:
+            state.reset_daily_counters()
+            # Also clear cosmetic fields the dashboard reads so the UI
+            # doesn't briefly show a stale "last_visitor_b64" image after
+            # the wipe.
+            state.update(
+                last_visitor_b64="",
+                last_alert_time="—",
+                last_live_alert="",
+                last_live_alert_time="—",
+                ai_alert="",
+                people_now=0,
+            )
+            summary["state_counters"] = True
+        except Exception:
+            current_app.logger.exception("state.reset_daily_counters failed")
+
+    # 3) SQLite tables.
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        for tbl in ("snapshots", "logs", "alerts"):
+            cur = conn.execute(f"DELETE FROM {tbl}")
+            summary["db_rows_deleted"] += cur.rowcount or 0
+            conn.execute("DELETE FROM sqlite_sequence WHERE name=?", (tbl,))
+        conn.commit()
+        conn.execute("VACUUM")
+        conn.close()
+    except Exception:
+        current_app.logger.exception("DB truncate failed")
+
+    # 4) Files on disk.
+    for d, key in ((SNAPSHOT_DIR, "snapshot_files_deleted"),
+                   (ALERTS_DIR, "alert_files_deleted")):
+        try:
+            for f in glob.glob(os.path.join(d, "*.jpg")):
+                try:
+                    os.unlink(f)
+                    summary[key] += 1
+                except OSError:
+                    pass
+        except Exception:
+            current_app.logger.exception("failed to clean %s", d)
+
+    try:
+        if os.path.exists(LOG_FILE):
+            os.unlink(LOG_FILE)
+            summary["visitor_log_deleted"] = True
+    except OSError:
+        pass
+
+    # 5b) Identity pickle. vision.factory_reset() above already
+    # overwrites it with empty state, but explicitly removing it
+    # protects against a stale file lingering if the cache write
+    # failed silently.
+    try:
+        identity_file = os.path.join(os.path.dirname(DB_PATH), "daily_identity.pkl")
+        if os.path.exists(identity_file):
+            os.unlink(identity_file)
+            summary["identity_cache_deleted"] = True
+    except OSError:
+        pass
+
+    return jsonify({"ok": True, "summary": summary})
 
 
 # ── Stats reset ───────────────────────────────────────────────────────────────────
