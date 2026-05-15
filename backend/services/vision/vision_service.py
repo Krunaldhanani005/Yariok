@@ -38,13 +38,17 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Generator, Optional, Tuple
 
 import cv2
 import numpy as np
 
-from backend.config.settings import ENTRY_ZONE
+from backend.config.settings import SNAPSHOT_COOLDOWN_SECONDS, ZONE_CONFIG_FILE
+from backend.core.business_day import (
+    now_ist,
+    seconds_until_next_business_day_start,
+)
 from backend.services.vision.face_engine import DetectedFace, FaceEngine
 from backend.services.vision.vector_store import DailyFaceCache
 
@@ -88,10 +92,26 @@ PRESENCE_PUBLISH_INTERVAL_SECONDS: float = 1.0
 
 @dataclass
 class _FaceJob:
-    """One unit of work for the face worker thread."""
+    """One unit of work for the face worker thread.
+
+    ``is_in_zone`` records whether the person's feet (bottom-center of
+    bbox) fell inside the user-configured entry polygon at detection
+    time. It is plumbed all the way to the MQTT payload so the AI
+    service can gate the VOICE greeting on zone membership while
+    snapshots and counters fire for every person regardless.
+
+    ``co_visible_track_ids`` is the snapshot of OTHER track_ids
+    visible in the same frame at dispatch time. The worker turns
+    those into the set of visitor_ids currently occupying the camera
+    view and forbids the new face/body from matching any of them —
+    the "co-occurrence exclusivity" rule that makes simultaneous
+    arrivals impossible to false-merge.
+    """
     frame: np.ndarray
     track_id: int
     bbox: Tuple[float, float, float, float]
+    is_in_zone: bool = True
+    co_visible_track_ids: tuple = ()   # tuple[int, ...] — other tracks in same frame
 
 
 # ── Service ─────────────────────────────────────────────────────────────────
@@ -162,6 +182,29 @@ class VisionService:
         self._in_flight_track_ids: set = set()
         self._in_flight_lock: threading.Lock = threading.Lock()
 
+        # ── Track stability tracker (recent-frames co-occurrence rule) ──
+        # Set of track ids emitted by BoT-SORT in the PREVIOUS frame.
+        # The co-occurrence exclusion is restricted to tracks that are
+        # both (a) emitted in the current frame AND (b) were already
+        # emitted in the previous frame — i.e., "stable" for ≥2 consecutive
+        # frames. Brief BoT-SORT ghost re-emissions (Kalman-prediction
+        # tracks that appear for one frame and vanish) are filtered out.
+        # The result: when the same person is briefly occluded and
+        # BoT-SORT spawns a new track id alongside the lingering old
+        # one, the old one (count=1 this frame) doesn't exclude the
+        # new one from matching the same visitor.
+        self._prev_frame_track_ids: set = set()
+
+        # ── Entry-zone polygon (greeting gate, NOT a detection filter) ──
+        # Stored normalized (0..1) so it survives camera-resolution changes.
+        # Empty list = default-allow: every detection is tagged in_zone=True.
+        # The polygon is loaded from disk on boot and hot-reloaded whenever
+        # /api/zone POSTs a new shape. Lock protects concurrent reads from
+        # the inference thread vs writes from Flask's HTTP thread.
+        self._zone_norm: list = []   # list[tuple[float, float]] of normalized (x, y)
+        self._zone_lock: threading.Lock = threading.Lock()
+        self.reload_zone()
+
         # ── Latest-frame slot (drop-oldest hand-off from grabber → inference) ──
         # Grabber thread writes the most recent decoded frame; inference
         # thread reads it. We never queue raw frames — keeping only the
@@ -213,7 +256,7 @@ class VisionService:
         self._spawn(self._run_grabber_loop,   name="vision-grabber")
         self._spawn(self._run_inference_loop, name="vision-inference")
         self._spawn(self._run_face_worker,    name="vision-face-worker")
-        self._spawn(self._run_midnight_reset, name="vision-midnight")
+        self._spawn(self._run_business_day_reset, name="vision-business-day")
         logger.info("VisionService started (%d threads).", len(self._threads))
 
     def stop(self, join_timeout: float = 5.0) -> None:
@@ -292,6 +335,73 @@ class VisionService:
             self._in_flight_track_ids.clear()
         logger.info("VisionService.factory_reset — daily identity cache wiped")
 
+    # ── Entry-zone polygon (voice-greeting gate, NOT a detection filter) ─
+
+    def reload_zone(self) -> None:
+        """Hot-reload the normalized entry polygon from disk.
+
+        Called once at construction and every time ``POST /api/zone``
+        saves a new polygon. Failure modes (missing file, malformed
+        JSON, invalid coords) all fall back to an empty polygon —
+        which means "no zone configured" → every detection is tagged
+        ``in_zone=True`` and voice greets everyone, as before.
+
+        Coords on disk are normalized [0.0, 1.0]; we keep them
+        normalized in memory and scale to pixel coordinates per-frame
+        inside :meth:`_point_in_zone`.
+        """
+        polygon: list = []
+        try:
+            if os.path.exists(ZONE_CONFIG_FILE):
+                with open(ZONE_CONFIG_FILE) as f:
+                    data = json.load(f)
+                raw = data.get("polygon", [])
+                for pt in raw:
+                    if (isinstance(pt, (list, tuple)) and len(pt) == 2
+                            and all(isinstance(c, (int, float)) for c in pt)
+                            and 0.0 <= pt[0] <= 1.0 and 0.0 <= pt[1] <= 1.0):
+                        polygon.append((float(pt[0]), float(pt[1])))
+                if 0 < len(polygon) < 3:
+                    # A 1- or 2-point polygon can't enclose anything;
+                    # treat as "no zone" rather than a degenerate one.
+                    logger.warning(
+                        "Zone polygon has only %d point(s) — ignoring "
+                        "(need ≥3). Default-allow remains in effect.",
+                        len(polygon),
+                    )
+                    polygon = []
+        except Exception:
+            logger.exception("reload_zone: failed to read %s", ZONE_CONFIG_FILE)
+            polygon = []
+
+        with self._zone_lock:
+            self._zone_norm = polygon
+        logger.info(
+            "Entry zone reloaded: %d points (%s)",
+            len(polygon),
+            "active" if polygon else "default-allow",
+        )
+
+    def _point_in_zone(self, x: float, y: float, fw: int, fh: int) -> bool:
+        """Return True if pixel (x, y) is inside the configured polygon.
+
+        Default-allow: no polygon configured → True for everything. Uses
+        ``cv2.pointPolygonTest`` (sub-microsecond), called once per
+        person per frame.
+        """
+        with self._zone_lock:
+            poly_norm = self._zone_norm
+        if not poly_norm:
+            return True
+        # Scale normalized polygon to current frame size on the fly.
+        # The polygon is small (a handful of points) so this is cheap;
+        # done per-call to handle frame-size changes without bookkeeping.
+        poly_px = np.array(
+            [[int(px * fw), int(py * fh)] for px, py in poly_norm],
+            dtype=np.int32,
+        )
+        return cv2.pointPolygonTest(poly_px, (float(x), float(y)), False) >= 0
+
     # ── Legacy compatibility shim ────────────────────────────────────────
 
     def run_calibration(self) -> None:
@@ -348,6 +458,13 @@ class VisionService:
                     continue
 
                 # Publish the freshest frame, replacing whatever was there.
+                # NOTE: we deliberately do NOT push to the stream queue
+                # here. The inference loop pushes the *annotated* frame
+                # (with bounding boxes) so the user can see which
+                # detections the system is acting on. That caps the
+                # MJPEG rate at YOLO's inference rate (~6 FPS on CPU);
+                # the user accepted that trade-off for the detection
+                # overlay.
                 with self._frame_lock:
                     self._latest_frame = frame
                 self._frame_ready.set()
@@ -390,6 +507,12 @@ class VisionService:
                 logger.exception("Inference loop error: %s", exc)
                 continue
 
+            # Push the annotated frame (with green bounding boxes around
+            # detected persons) to the MJPEG stream. This caps the
+            # browser-visible rate at YOLO's inference rate (~6 FPS on
+            # CPU), but in return the user can SEE which people the
+            # system is currently tracking — a UX requirement that
+            # outweighs the smoothness gain from streaming raw frames.
             self._enqueue_stream_frame(annotated)
             self._maybe_publish_presence(active_track_ids)
 
@@ -451,59 +574,81 @@ class VisionService:
             return self._resize_for_stream(display), active_ids
 
         fh, fw = display.shape[:2]
+
+        # ── Pass 1: collect every plausible track in this frame ─────────
+        # We need ALL valid track_ids up front so each face-job can be
+        # told who its CO-VISIBLE siblings are. The dispatch loop below
+        # is the second pass; this two-pass split is the only reason
+        # we don't dispatch immediately inside the YOLO iteration.
+        plausible: list = []   # list of (track_id, bbox, is_in_zone)
         for (x1, y1, x2, y2), tid in zip(xyxy_all, ids_all):
             track_id = int(tid)
             bbox = (float(x1), float(y1), float(x2), float(y2))
 
-            # ── Plausibility filter — reject non-person YOLO bboxes ─────
-            # Without this, YOLO will flag wall posters, table objects,
-            # and reflections as "persons" and each gets registered as a
-            # separate visitor with its own face embedding.
             bw = x2 - x1
             bh = y2 - y1
             if (bh < MIN_PERSON_HEIGHT_PX
                 or bw <= 0
                 or (bh / bw) < MIN_PERSON_ASPECT
                 or (bw * bh) < MIN_PERSON_AREA_PX):
-                # Don't include in active_ids either: the presence
-                # broadcast should reflect real humans only.
+                # YOLO flagged a poster / table / reflection — skip
+                # for ALL purposes including the presence broadcast.
                 continue
 
-            # ── Entry-zone filter ───────────────────────────────────────
-            # Only consider bboxes whose centre falls inside the
-            # configured ENTRY_ZONE (normalised x1, y1, x2, y2). This
-            # silences wall posters / scenery / reflections that sit in
-            # frame regions the receptionist would never see a real
-            # visitor walk through.
-            cx = (x1 + x2) * 0.5 / fw
-            cy = (y1 + y2) * 0.5 / fh
-            if not (ENTRY_ZONE[0] <= cx <= ENTRY_ZONE[2]
-                    and ENTRY_ZONE[1] <= cy <= ENTRY_ZONE[3]):
-                continue
+            feet_x = (x1 + x2) * 0.5
+            feet_y = y2
+            is_in_zone = self._point_in_zone(feet_x, feet_y, fw, fh)
+            plausible.append((track_id, bbox, is_in_zone))
 
+        # Set of ALL track_ids currently visible in this frame.
+        current_tids = {t for (t, _b, _z) in plausible}
+
+        # ── Recent-frames co-occurrence pool ──────────────────────────────
+        # A track contributes to another track's co_visible exclusion
+        # ONLY IF it qualifies as "trustworthy" by either:
+        #
+        #   • stability — emitted in BOTH the current frame AND the
+        #     previous frame (BoT-SORT ghost tracks that appear for
+        #     just one frame fail this test), OR
+        #   • already-bound — already resolved to a visitor_id by an
+        #     earlier worker call. Once we know who a track belongs to,
+        #     it's authoritative even if its stability count is fresh.
+        #     This safeguards the "two strangers arrive same frame"
+        #     guarantee: the moment track A is bound to visitor 0,
+        #     track B's search excludes visitor 0 even on frame 1.
+        stable_tids = current_tids & self._prev_frame_track_ids
+        bound_tids  = self._face_cache.known_track_ids_snapshot() & current_tids
+        co_visible_pool = stable_tids | bound_tids
+
+        # ── Pass 2: draw boxes, gate, dispatch ───────────────────────────
+        for track_id, bbox, is_in_zone in plausible:
             active_ids.append(track_id)
             self._draw_box(display, bbox, track_id)
 
-            # GATE 1 — already greeted today, skip face work entirely.
+            # GATE 1 — already resolved today, skip face work entirely.
             if self._face_cache.is_track_known(track_id):
                 continue
 
-            # GATE 1b — already enqueued and being evaluated by the
-            # worker. Without this check we'd send 5–10 duplicate jobs
-            # per second for the same brand-new person while the worker
-            # is still chewing on the first one, filling the bounded
-            # queue and starving anyone else who walked into the same
-            # frame. Add-then-enqueue (not enqueue-then-add) closes the
-            # race window where the worker could finish before the
-            # camera thread marks the id in-flight.
+            # GATE 1b — already enqueued and being evaluated.
             with self._in_flight_lock:
                 if track_id in self._in_flight_track_ids:
                     continue
                 self._in_flight_track_ids.add(track_id)
 
+            # Co-occurrence exclusivity: every OTHER trustworthy track
+            # in the pool is forbidden from sharing this job's visitor_id.
+            # Cast to tuple so the _FaceJob is hashable / picklable.
+            co_visible = tuple(t for t in co_visible_pool if t != track_id)
+
             try:
                 self._face_queue.put_nowait(
-                    _FaceJob(frame=frame.copy(), track_id=track_id, bbox=bbox)
+                    _FaceJob(
+                        frame=frame.copy(),
+                        track_id=track_id,
+                        bbox=bbox,
+                        is_in_zone=is_in_zone,
+                        co_visible_track_ids=co_visible,
+                    )
                 )
             except queue.Full:
                 # Roll the in-flight marker back so the NEXT frame can
@@ -515,6 +660,11 @@ class VisionService:
                     track_id,
                 )
 
+        # Roll the previous-frame set forward so the next call's
+        # stability check has accurate data. The set tracks ALL
+        # plausibility-passing track ids from this frame, not just
+        # the ones we dispatched.
+        self._prev_frame_track_ids = current_tids
         return self._resize_for_stream(display), active_ids
 
     def _maybe_publish_presence(self, active_track_ids: list) -> None:
@@ -615,63 +765,108 @@ class VisionService:
                 if face_emb is None or face_emb.size == 0:
                     face_emb = None
 
-        # ── Gate 4: identity search (hybrid) ─────────────────────────
-        match = self._face_cache.search(face_embedding=face_emb, body_hist=body_hist)
-        if match.matched:
-            # Same person — BoT-SORT just gave them a new track id.
-            # Mark the new id known and stay silent (no snapshot, no greet).
-            # The cache itself appends the new body view internally on
-            # every successful match, so we don't double-call here.
-            self._face_cache.mark_track_known(job.track_id)
-            logger.info(
-                "Re-identified via %s on new track_id=%d (sim=%.3f → visitor #%d)",
-                match.kind, job.track_id, match.score, match.index,
-            )
-            return
-
-        # ── Defer if we have no face ─────────────────────────────────
-        # A face is REQUIRED to register a new visitor. Without one we
-        # cannot tell apart "new person walked in back-first" from "the
-        # same person who just turned around". HSV body color is too
-        # ambiguous on its own — that's the lesson from the prior
-        # duplicate-greet bug.
-        #
-        # We do NOT mark the track id known: a subsequent frame may
-        # catch a clear face for this same track, at which point we
-        # can resolve identity definitively.
-        if face_emb is None:
-            logger.debug(
-                "Faceless candidate, deferring registration — track_id=%d body_score=%.3f",
-                job.track_id, match.score,
-            )
-            return
-
-        # ── Decision: BRAND NEW VISITOR (face confirmed) ─────────────
-        visitor_id = self._face_cache.add_visitor(
-            face_embedding=face_emb, body_hist=body_hist
+        # ── Gate 4: identity search (hybrid, with co-occurrence guard) ──
+        # Any visitor_id currently bound to ANOTHER active track in the
+        # same frame must NOT be a candidate for this face — that's
+        # the rule that mathematically prevents simultaneously-visible
+        # strangers from being merged into the same visitor.
+        excluded_vids = self._face_cache.visitor_ids_for_tracks(
+            job.co_visible_track_ids,
         )
-        self._face_cache.mark_track_known(job.track_id)
+        match = self._face_cache.search(
+            face_embedding=face_emb,
+            body_hist=body_hist,
+            excluded_visitor_ids=excluded_vids,
+        )
 
+        # Resolve the two policy flags up front so the rest of this
+        # method is just "given the decisions, do the work".
+        #
+        #   is_first_sighting_today
+        #       True  → this visitor is not yet in today's cache. Will
+        #               be added below if we have a face. Greet fires
+        #               (subject to zone). Snapshot is unconditional.
+        #       False → known visitor on a new BoT-SORT track id. No
+        #               greet ever. Snapshot only if cooldown elapsed.
+        #
+        #   should_snapshot, should_greet
+        #       Per spec:
+        #         should_snapshot = is_first_sighting OR cooldown_elapsed
+        #         should_greet    = is_first_sighting AND in_zone
+        is_first_sighting = not match.matched
+
+        if not is_first_sighting:
+            # Known visitor — silent re-ID for everything except the
+            # 10-minute refresh-snapshot path.
+            visitor_id = int(match.index)
+            self._face_cache.mark_track_known(job.track_id, visitor_id)
+            time_since_snap = self._face_cache.time_since_snapshot(visitor_id)
+            should_snapshot = time_since_snap >= SNAPSHOT_COOLDOWN_SECONDS
+            should_greet = False
+            if not should_snapshot:
+                logger.info(
+                    "Re-identified via %s on new track_id=%d (sim=%.3f → "
+                    "visitor #%d) — within %ds cooldown, no refresh snapshot",
+                    match.kind, job.track_id, match.score, visitor_id,
+                    SNAPSHOT_COOLDOWN_SECONDS,
+                )
+                return
+            # Cooldown elapsed → take a refresh snapshot, no greet.
+            self._face_cache.mark_snapshot(visitor_id)
+        else:
+            # No match. We still REQUIRE a face to confirm "brand new
+            # visitor" — body color alone is too ambiguous (see the
+            # prior duplicate-greet bug). Defer the track if face is
+            # missing; the camera will retry on the next frame.
+            if face_emb is None:
+                logger.debug(
+                    "Faceless candidate, deferring registration — "
+                    "track_id=%d body_score=%.3f",
+                    job.track_id, match.score,
+                )
+                return
+            visitor_id = self._face_cache.add_visitor(
+                face_embedding=face_emb, body_hist=body_hist,
+            )
+            self._face_cache.mark_track_known(job.track_id, visitor_id)
+            should_snapshot = True
+            should_greet = bool(job.is_in_zone)
+            time_since_snap = 0.0  # just registered → freshly stamped
+
+        # If we got here, ``should_snapshot`` is True.
         # Snapshot = the FULL frame (CCTV scene), not the face crop.
-        # This matches Phase A's UX expectation in the gallery page.
         image_b64 = self._encode_snapshot_base64(job.frame)
 
         payload = {
-            "type": "new_visitor_detected",
+            "type": "visitor_snapshot",     # renamed: now covers refresh too
             "visitor_id": int(visitor_id),
             "track_id": int(job.track_id),
             "image_base64": image_b64,           # ← full frame JPEG, base64
+            "is_first_sighting": is_first_sighting,
+            "should_greet": should_greet,
+            "in_zone": bool(job.is_in_zone),
             "has_face": face_emb is not None,
             "face_quality": round(face_quality, 2),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            # IST wall-clock ISO timestamp — single source of truth.
+            "timestamp": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._publish_event(payload)
-        logger.info(
-            "NEW visitor #%d — track_id=%d has_face=%s face_quality=%.1f "
-            "(best_body=%.3f best_face=%.3f via=%s)",
-            visitor_id, job.track_id, face_emb is not None, face_quality,
-            match.body_score, match.face_score, match.kind,
-        )
+
+        if is_first_sighting:
+            logger.info(
+                "NEW visitor #%d — track_id=%d has_face=%s face_quality=%.1f "
+                "in_zone=%s should_greet=%s (best_body=%.3f best_face=%.3f via=%s)",
+                visitor_id, job.track_id, face_emb is not None, face_quality,
+                "YES" if job.is_in_zone else "no",
+                "YES" if should_greet else "no",
+                match.body_score, match.face_score, match.kind,
+            )
+        else:
+            logger.info(
+                "Refresh snapshot for visitor #%d — track_id=%d "
+                "(via=%s sim=%.3f, %.0fs since last snapshot)",
+                visitor_id, job.track_id, match.kind, match.score, time_since_snap,
+            )
 
     # ── Streaming helpers ────────────────────────────────────────────────
 
@@ -839,42 +1034,40 @@ class VisionService:
             logger.exception("YOLO load failed: %s", exc)
             self._yolo = None
 
-    # ── Midnight reset ───────────────────────────────────────────────────
+    # ── Business-day rollover (09:00 IST) ────────────────────────────────
 
-    def _run_midnight_reset(self) -> None:
-        """Reset the daily face cache once per local midnight.
+    def _run_business_day_reset(self) -> None:
+        """Reset the daily identity cache at 09:00:00 IST.
 
-        Computes seconds-until-midnight, sleeps in 1-second slices so
-        ``stop()`` can interrupt without waiting hours, then resets.
+        Anyone seen at 08:59 IST is part of yesterday's business day;
+        anyone seen at 09:01 IST is part of today's. Sleeps in
+        1-second slices so ``stop()`` can interrupt without waiting
+        hours, then resets the cache and fires the on-midnight
+        callback (which despite its legacy name now triggers at 9 AM).
         """
         while not self._stop_event.is_set():
-            seconds_to_midnight = self._seconds_until_next_midnight()
-            # Sleep in small slices so shutdown is responsive.
+            seconds_to_rollover = seconds_until_next_business_day_start()
             slept = 0.0
-            while slept < seconds_to_midnight and not self._stop_event.is_set():
-                step = min(1.0, seconds_to_midnight - slept)
+            while slept < seconds_to_rollover and not self._stop_event.is_set():
+                step = min(1.0, seconds_to_rollover - slept)
                 if self._stop_event.wait(timeout=step):
                     return
                 slept += step
             if self._stop_event.is_set():
                 return
             self._face_cache.reset()
-            logger.info("Midnight reset fired — daily face cache cleared.")
-            # Notify the rest of the system (e.g. StateManager) that the
-            # day has rolled over so persistent daily counters also reset.
+            logger.info(
+                "Business-day rollover (09:00 IST) — daily identity cache cleared.",
+            )
+            # Notify the rest of the system (StateManager + DB prune)
+            # that the day has rolled over. The constructor arg name
+            # is still ``on_midnight_reset`` for backward compat — the
+            # callback contract is unchanged, only the trigger time.
             if self._on_midnight_reset is not None:
                 try:
                     self._on_midnight_reset()
                 except Exception:
                     logger.exception("on_midnight_reset callback raised")
-
-    @staticmethod
-    def _seconds_until_next_midnight() -> float:
-        now = datetime.now()
-        tomorrow = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        return max(1.0, (tomorrow - now).total_seconds())
 
     # ── Thread / sleep helpers ───────────────────────────────────────────
 

@@ -143,7 +143,30 @@ class AIService:
 
     # ── Event handlers ──────────────────────────────────────────────────────────
 
-    def _on_visitor_detected(self, frame, visitor_num: int, mode: str) -> None:
+    def _on_visitor_detected(
+        self,
+        frame,
+        visitor_num: int,
+        mode: str,
+        in_zone: bool = True,
+    ) -> None:
+        # Phase C entry-zone gate: visitors outside the configured polygon
+        # still get a snapshot + DB row + counter bump (handled upstream in
+        # MqttStateBridge), but the VOICE stays silent. Default-allow when
+        # the publisher didn't tag the event so we never silently regress
+        # callers that haven't been updated.
+        if not in_zone:
+            # Bumped from DEBUG → INFO so this is visible in production
+            # logs when the user is wondering "why didn't the system
+            # greet that person?". The answer: their feet weren't inside
+            # the configured entry polygon.
+            logger.info(
+                "Visitor #%s outside entry zone — voice greeting silenced "
+                "(snapshot + counter still recorded).",
+                visitor_num,
+            )
+            return
+
         greeting = self.llm_greet_vision(visitor_num, frame)
         self._bus.publish(EV_SPEAK_TEXT, text=greeting)
         if mode == MODE_KARAOKE:

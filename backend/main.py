@@ -45,7 +45,12 @@ logger = logging.getLogger(__name__)
 from backend.core.event_bus import bus
 from backend.core.state_manager import state
 from backend.core.service_registry import registry
-from backend.config.settings import DASHBOARD_PORT, RTSP_URL
+from backend.config.settings import (
+    DASHBOARD_PORT,
+    RTSP_URL,
+    SNAPSHOT_MAX_COUNT,
+    SNAPSHOT_RETENTION_DAYS,
+)
 
 # ── Services (legacy camera_service is INTENTIONALLY not imported) ────────────
 from backend.services.database.db_service import DatabaseService
@@ -115,10 +120,34 @@ db = DatabaseService()
 # thread into StateManager so the persistent counters in
 # ``daily_state.json`` roll over to zero at the same moment the
 # face/body identity cache does.
+def _daily_rollover() -> None:
+    """Combined midnight callback: reset daily counters AND prune old snapshots.
+
+    The vision service's midnight thread invokes this once at local 00:00.
+    Order:
+      1. ``state.reset_daily_counters()`` zeros visitors / snapshots / alerts
+         counters and refreshes the date stamp in ``daily_state.json``.
+      2. ``db.prune_old_snapshots(...)`` deletes snapshot files + DB rows
+         that exceed the retention limits set in ``settings.py``.
+    Exceptions are caught so a prune failure can't block the counter reset.
+    """
+    try:
+        state.reset_daily_counters()
+    except Exception:
+        logger.exception("daily_rollover: state.reset_daily_counters failed")
+    try:
+        db.prune_old_snapshots(
+            days=SNAPSHOT_RETENTION_DAYS,
+            max_count=SNAPSHOT_MAX_COUNT,
+        )
+    except Exception:
+        logger.exception("daily_rollover: snapshot prune failed")
+
+
 vision = VisionService(
     rtsp_url=RTSP_URL,
     mqtt_client=mqtt_client,
-    on_midnight_reset=state.reset_daily_counters,
+    on_midnight_reset=_daily_rollover,
 )
 
 voice      = VoiceService(state, bus)
@@ -157,6 +186,17 @@ def main() -> None:
     # ── Database ──────────────────────────────────────────────────────────────
     db.init_db()
     db.log_event("=== System boot (Phase B) ===", "system")
+
+    # Catch up on snapshot retention. The midnight cron handles the
+    # steady-state case; this one-shot covers long-running deployments
+    # that may have just been restarted hours into a backlog.
+    try:
+        db.prune_old_snapshots(
+            days=SNAPSHOT_RETENTION_DAYS,
+            max_count=SNAPSHOT_MAX_COUNT,
+        )
+    except Exception:
+        logger.exception("startup snapshot prune failed")
 
     # ── TTS / LLM init (unchanged from Phase A) ───────────────────────────────
     voice.init()

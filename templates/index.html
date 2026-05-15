@@ -37,6 +37,29 @@
     <div class="hud-br">
       <div class="cam-time" id="cam-time">—</div>
     </div>
+
+    <!-- ─── Entry-zone setup overlay (HIDDEN by default) ───────────────
+         The canvas is positioned absolutely on top of #cam-img and is
+         only made visible while the user is editing the polygon. Once
+         a zone is saved, this whole block is reset to display:none so
+         the live stream stays 100% clean. Lines are NEVER drawn onto
+         the MJPEG stream itself — that happens on the canvas only. -->
+    <canvas id="zone-canvas"
+            style="position:absolute; inset:0; width:100%; height:100%;
+                   display:none; cursor:crosshair; z-index:5;"></canvas>
+    <div id="zone-toolbar"
+         style="position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+                display:none; z-index:6; gap:8px; padding:10px 14px;
+                background:rgba(0,0,0,.78); border-radius:10px; align-items:center;">
+      <span id="zone-help" style="color:#cfd6e0;font-size:12px;margin-right:8px;">
+        Click to add points · ≥3 points to save
+      </span>
+      <button class="sb-btn" id="zone-btn-undo"   onclick="zoneUndo()"   style="padding:5px 10px;font-size:12px;">Undo</button>
+      <button class="sb-btn" id="zone-btn-clear"  onclick="zoneClear()"  style="padding:5px 10px;font-size:12px;">Clear</button>
+      <button class="sb-btn" id="zone-btn-cancel" onclick="zoneCancel()" style="padding:5px 10px;font-size:12px;">Cancel</button>
+      <button class="sb-btn" id="zone-btn-save"   onclick="zoneSave()"
+              style="padding:5px 14px;font-size:12px;background:#1e3a4a;border-color:#2a5a78;color:#9adcff;">Save Zone</button>
+    </div>
   </div>
 
   <!-- ══ RIGHT: SIDEBAR ══ -->
@@ -109,6 +132,13 @@
       <div class="sb-grid-2">
         <button class="sb-btn" onclick="takeSnapshot(this)"><span class="bi">📸</span>SNAPSHOT</button>
         <button class="sb-btn" onclick="resetStats(this)"><span class="bi">↺</span>RESET STATS</button>
+      </div>
+      <div style="margin-top:8px">
+        <button class="sb-btn sb-btn-full" id="btn-zone-setup" onclick="zoneStart()"
+                title="Draw the door/entry polygon used to gate voice greetings.">
+          <span class="bi">🎯</span>
+          <span id="zone-btn-label">SETUP ENTRY ZONE</span>
+        </button>
       </div>
     </div>
 
@@ -559,9 +589,298 @@ async function refreshLog() {
   } catch(_) {}
 }
 
-setInterval(refresh,    800);
-setInterval(refreshLog, 2500);
+/* ── Polling tick (fallback + safety net) ──────────────────────────────────
+ * Two intervals:
+ *   - statusTimer:  fast polling when EventSource is dead, slow when alive.
+ *   - logTimer:     unchanged — there's no SSE for logs.
+ * The IDs let us reconfigure intervals from the SSE handlers below. */
+let statusTimer = setInterval(refresh, 800);
+const logTimer  = setInterval(refreshLog, 2500);
 refresh(); refreshLog();
+
+/* ── Server-Sent Events for near-instant updates ───────────────────────────
+ * The browser opens a single long-lived HTTP stream to /api/events. Every
+ * time the backend (MqttStateBridge) mutates state, it pushes a small JSON
+ * delta down this stream and we trigger a refresh() to re-pull the full
+ * /api/status — same UI code path as polling, just push-triggered.
+ *
+ * When SSE is healthy we slow the polling tick to 5 s (safety net only).
+ * When SSE fails (broker dies, network blip, corporate proxy that buffers
+ * event-stream), EventSource auto-retries, and the catch path here speeds
+ * polling back up to 800 ms so the UI keeps working.
+ */
+let _evt = null;
+function setPollFast()  { clearInterval(statusTimer); statusTimer = setInterval(refresh, 800);  }
+function setPollSlow()  { clearInterval(statusTimer); statusTimer = setInterval(refresh, 5000); }
+
+function startEventStream() {
+  if (typeof EventSource === 'undefined') return;  // ancient browser → polling stays fast
+  try {
+    _evt = new EventSource('/api/events');
+  } catch (_) { return; }
+
+  _evt.onopen = () => {
+    console.debug('[SSE] connected — slowing polling to 5 s');
+    setPollSlow();
+  };
+
+  _evt.onmessage = (ev) => {
+    /* Any push event = "something changed, re-pull the full state".
+     * The delta payload is in ev.data but we deliberately keep all UI
+     * mutation logic inside refresh() — one place, one bug surface. */
+    try {
+      const msg = JSON.parse(ev.data);
+      // Skip the initial snapshot (refresh() runs once on page load anyway)
+      // and ignore keep-alive comments (they don't fire onmessage).
+      refresh();
+      // visitor events also bring a fresh thumbnail — refresh handles it.
+    } catch (_) { /* malformed event — ignore */ }
+  };
+
+  _evt.onerror = () => {
+    /* EventSource will keep auto-retrying in the background. While it's
+     * down, switch polling back to fast so the UI stays responsive. */
+    console.debug('[SSE] error — restoring fast polling');
+    setPollFast();
+  };
+}
+startEventStream();
+
+/* ── Entry-zone setup tool ──────────────────────────────────────────────────
+ * Click-to-add-points polygon editor that lives on a canvas overlay above
+ * the live stream. Behaviour the spec asked for:
+ *   • Activated only by the SETUP ENTRY ZONE button (canvas hidden otherwise).
+ *   • Coordinates POSTed to /api/zone are NORMALIZED (0–1) so the same
+ *     polygon is correct at any stream resolution.
+ *   • Lines are drawn on the canvas overlay — NEVER on the MJPEG stream.
+ *   • Once saved, the canvas + toolbar revert to display:none and the
+ *     live feed is 100% clean again.
+ */
+const zoneState = { active: false, points: [] };
+
+function _zoneEls() {
+  return {
+    canvas:  document.getElementById('zone-canvas'),
+    toolbar: document.getElementById('zone-toolbar'),
+    btn:     document.getElementById('btn-zone-setup'),
+    label:   document.getElementById('zone-btn-label'),
+    help:    document.getElementById('zone-help'),
+  };
+}
+
+function _zoneResizeCanvas() {
+  /* Size + position the canvas to overlay the ACTUAL image content
+   * inside <img id="cam-img">, not the <img> element's bounding box.
+   *
+   * Why: the camera image may render with object-fit: contain/cover/
+   * etc. inside its parent, leaving letterbox/pillarbox bands around
+   * the visible pixels. If the canvas covered the whole element
+   * (bands included), a user click on what they SEE as "the floor"
+   * would actually land at a canvas-y that, normalized, points to a
+   * different region of the underlying RTSP frame entirely. That's
+   * the bug that made the saved polygon land in the upper half of
+   * the scene instead of around the door.
+   *
+   * Fix: derive the content rect from the image's naturalWidth/Height
+   * (the MJPEG stream's true dimensions, updated each frame by the
+   * browser) and the element's getBoundingClientRect(), assuming the
+   * default object-fit: contain. Then place + size the canvas exactly
+   * over that content rect so clicks normalize 1:1.
+   */
+  const { canvas } = _zoneEls();
+  const camImg = document.getElementById('cam-img');
+  const wrap   = document.getElementById('cam-wrap');
+  const r      = camImg.getBoundingClientRect();
+  const wrapR  = wrap.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return;
+
+  const nW = camImg.naturalWidth  || 960;  // MJPEG width  fallback
+  const nH = camImg.naturalHeight || 540;  // MJPEG height fallback
+  const imgAR  = nW / nH;
+  const elemAR = r.width / r.height;
+
+  // object-fit: contain math — pick the dimension that fits, center the other.
+  let dispW, dispH, dx, dy;
+  if (imgAR > elemAR) {
+    // Image wider than element → letterbox top + bottom.
+    dispW = r.width;
+    dispH = r.width / imgAR;
+    dx = (r.left - wrapR.left);
+    dy = (r.top  - wrapR.top) + (r.height - dispH) / 2;
+  } else {
+    // Image taller than element → pillarbox left + right.
+    dispH = r.height;
+    dispW = r.height * imgAR;
+    dx = (r.left - wrapR.left) + (r.width - dispW) / 2;
+    dy = (r.top  - wrapR.top);
+  }
+
+  // Override the inset:0 from the inline style — we now position
+  // the canvas precisely over the content rect.
+  canvas.style.inset  = 'auto';
+  canvas.style.left   = `${dx}px`;
+  canvas.style.top    = `${dy}px`;
+  canvas.style.width  = `${dispW}px`;
+  canvas.style.height = `${dispH}px`;
+  canvas.width  = Math.round(dispW);
+  canvas.height = Math.round(dispH);
+}
+
+function _zoneRedraw() {
+  const { canvas, help } = _zoneEls();
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const pts = zoneState.points;
+
+  // Translucent fill for the (auto-closing) polygon preview.
+  if (pts.length >= 3) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(56,189,248,.20)';
+    ctx.fill();
+  }
+
+  // Edges (open chain while drawing; auto-closed when ≥3 points).
+  if (pts.length >= 2) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    if (pts.length >= 3) ctx.closePath();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#38bdf8';
+    ctx.stroke();
+  }
+
+  // Vertex handles.
+  ctx.fillStyle = '#f0f9ff';
+  for (const p of pts) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#0c4a6e';
+    ctx.stroke();
+  }
+
+  help.textContent = pts.length < 3
+    ? `Click to add points · ${pts.length}/3 minimum`
+    : `${pts.length} points · click Save Zone when ready`;
+}
+
+function _zoneOnClick(ev) {
+  const { canvas } = _zoneEls();
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  zoneState.points.push({ x, y });
+  _zoneRedraw();
+}
+
+async function zoneStart() {
+  /* Open setup mode: show the canvas + toolbar, hydrate any existing
+   * polygon, and arm click-to-add. The live stream keeps playing
+   * underneath — the canvas is purely an overlay. */
+  const { canvas, toolbar, btn } = _zoneEls();
+  const camImg = document.getElementById('cam-img');
+  // Need the stream to actually be running so naturalWidth/Height
+  // are defined (otherwise the canvas math goes 0×0 and any click
+  // saves nonsense). The previous polygon save with wrong coords
+  // was almost certainly this case.
+  if (camImg.style.display === 'none'
+      || !camImg.naturalWidth || !camImg.naturalHeight) {
+    alert("Start the system first — the entry zone is drawn on the live camera feed.");
+    return;
+  }
+  zoneState.active = true;
+  zoneState.points = [];
+  _zoneResizeCanvas();
+
+  // Pre-load whatever zone is already saved so the user is editing,
+  // not always starting from scratch.
+  try {
+    const r = await fetch('/api/zone').then(x => x.json());
+    if (Array.isArray(r.polygon) && r.polygon.length) {
+      zoneState.points = r.polygon.map(([nx, ny]) => ({
+        x: nx * canvas.width,
+        y: ny * canvas.height,
+      }));
+    }
+  } catch (_) {}
+
+  canvas.style.display  = 'block';
+  toolbar.style.display = 'flex';
+  btn.disabled = true;
+  canvas.addEventListener('click', _zoneOnClick);
+  _zoneRedraw();
+}
+
+function _zoneClose() {
+  const { canvas, toolbar, btn } = _zoneEls();
+  canvas.removeEventListener('click', _zoneOnClick);
+  // Wipe the canvas before hiding so a stale drawing can never flash
+  // back into view on the next setup session.
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  canvas.style.display  = 'none';
+  toolbar.style.display = 'none';
+  btn.disabled = false;
+  zoneState.active = false;
+  zoneState.points = [];
+}
+
+function zoneUndo()  { zoneState.points.pop(); _zoneRedraw(); }
+function zoneClear() { zoneState.points = [];  _zoneRedraw(); }
+function zoneCancel() { _zoneClose(); _zoneRefreshLabel(); }
+
+async function zoneSave() {
+  const { canvas, label } = _zoneEls();
+  if (zoneState.points.length > 0 && zoneState.points.length < 3) {
+    alert('A zone needs at least 3 points (or zero to clear it).');
+    return;
+  }
+  // Convert canvas-space pixels → NORMALIZED [0, 1] coords so the
+  // server can store a resolution-independent polygon.
+  const polygon = zoneState.points.map(p => [
+    Math.max(0, Math.min(1, p.x / canvas.width)),
+    Math.max(0, Math.min(1, p.y / canvas.height)),
+  ]);
+  label.textContent = 'SAVING…';
+  try {
+    const r = await fetch('/api/zone', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ polygon }),
+    }).then(x => x.json());
+    if (!r.ok) {
+      alert('Save failed: ' + (r.error || 'unknown'));
+      return;
+    }
+  } catch (e) {
+    alert('Save error: ' + e);
+    return;
+  } finally {
+    _zoneClose();
+    _zoneRefreshLabel();
+  }
+}
+
+async function _zoneRefreshLabel() {
+  /* Update the side-panel button text to reflect whether a zone is
+   * currently configured. Read-only — does NOT redraw the canvas. */
+  const { label } = _zoneEls();
+  try {
+    const r = await fetch('/api/zone').then(x => x.json());
+    const n = Array.isArray(r.polygon) ? r.polygon.length : 0;
+    label.textContent = n
+      ? `EDIT ENTRY ZONE (${n} pts)`
+      : 'SETUP ENTRY ZONE';
+  } catch (_) {
+    label.textContent = 'SETUP ENTRY ZONE';
+  }
+}
+_zoneRefreshLabel();
 </script>
 
 <!-- ═══════════ IMAGE PREVIEW MODAL ═══════════ -->

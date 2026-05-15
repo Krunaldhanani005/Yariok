@@ -87,6 +87,146 @@ body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui
 
 .empty { color:var(--muted); font-size:14px; padding:40px 0; text-align:center; }
 
+/* ── Per-visitor tile (one card per identified person, click to expand) ──
+ *
+ * Each detected person gets ONE compact tile in the day's grid (cover
+ * image + name + snap count). Clicking the tile opens a modal that
+ * shows ALL of that visitor's frames laid out in a grid. This stops
+ * the page from being dominated by 10× repeated snapshots of the
+ * same person — typical when the 10-minute refresh cooldown has
+ * fired several times in a day. */
+.visitors-grid {
+  display:grid; gap:14px;
+  grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));
+  padding:12px 0 6px;
+}
+.visitor-tile {
+  position:relative; border:1px solid var(--border2); border-radius:12px;
+  overflow:hidden; cursor:pointer; background:var(--card);
+  transition:border-color .2s, transform .2s;
+}
+.visitor-tile:hover { border-color:var(--blue); transform:translateY(-2px); }
+.visitor-tile img {
+  width:100%; height:170px; object-fit:cover; display:block;
+  background:var(--border);
+}
+.visitor-tile-info {
+  padding:10px 12px; border-top:1px solid var(--border2);
+  display:flex; justify-content:space-between; align-items:center;
+}
+.visitor-tile-name  { font-size:13px; font-weight:700; color:var(--text); }
+.visitor-tile-meta  { font-size:11px; color:var(--muted); }
+.visitor-tile-badge {
+  position:absolute; top:8px; right:8px;
+  background:rgba(0,0,0,.62); color:#fff;
+  padding:3px 9px; border-radius:14px;
+  font-size:11px; font-weight:600;
+  backdrop-filter:blur(4px);
+}
+
+/* ── Expand-modal: shows every snapshot for one visitor ────────────────── */
+.visitor-modal {
+  display:none; position:fixed; inset:0; z-index:1000;
+  background:rgba(0,0,0,.85); padding:40px 20px; overflow-y:auto;
+}
+.visitor-modal.open { display:block; }
+.vm-body {
+  max-width:1100px; margin:0 auto;
+  background:var(--bg); border:1px solid var(--border2); border-radius:14px;
+  padding:18px;
+}
+.vm-header {
+  display:flex; justify-content:space-between; align-items:center;
+  padding-bottom:12px; border-bottom:1px solid var(--border2); margin-bottom:14px;
+}
+.vm-title { font-size:18px; font-weight:700; color:var(--text); }
+.vm-meta  { font-size:12px; color:var(--muted); }
+.vm-close {
+  background:transparent; border:1px solid var(--border2); color:var(--text);
+  padding:6px 14px; border-radius:8px; cursor:pointer; font-size:13px;
+}
+.vm-close:hover { background:rgba(255,255,255,.05); }
+.vm-grid {
+  display:grid; gap:12px;
+  grid-template-columns:repeat(auto-fill, minmax(200px, 1fr));
+}
+
+/* "Other snapshots" (ungrouped / manual / legacy rows) stays as a
+ * compact flat strip below the visitor tiles — they have no
+ * person-grouping to expand. */
+.misc-strip {
+  margin-top:14px; border-top:1px dashed var(--border2); padding-top:12px;
+}
+.misc-strip .misc-label {
+  font-size:11px; color:var(--muted); margin-bottom:8px;
+  text-transform:uppercase; letter-spacing:.5px;
+}
+
+/* ── Layer 3 — Full-screen carousel lightbox ──────────────────────────────
+ *
+ * Opens when the user clicks a snap inside the visitor modal. Shows the
+ * image at near-fullscreen size, with:
+ *   • on-screen ‹  › arrows (large click targets)
+ *   • ArrowLeft / ArrowRight keyboard support
+ *   • Esc to close
+ *   • bottom-center: "N / total · HH:MM:SS"
+ *   • top-right: ✕ close
+ *
+ * The wrap-around behaviour means hitting › on the last image jumps
+ * back to the first — standard VMS carousel UX.
+ */
+.carousel-modal {
+  display:none; position:fixed; inset:0; z-index:1100;
+  background:rgba(0,0,0,.94);
+}
+.carousel-modal.open { display:flex; align-items:center; justify-content:center; }
+
+.carousel-stage {
+  position:relative; max-width:96vw; max-height:88vh;
+  display:flex; align-items:center; justify-content:center;
+}
+.carousel-img {
+  max-width:96vw; max-height:88vh;
+  object-fit:contain; border-radius:6px;
+  box-shadow:0 24px 60px rgba(0,0,0,.6);
+  display:block;
+}
+
+.carousel-arrow {
+  position:absolute; top:50%; transform:translateY(-50%);
+  width:54px; height:78px; border:none; border-radius:8px;
+  background:rgba(20,24,32,.6); color:#fff; font-size:36px;
+  cursor:pointer; user-select:none;
+  display:flex; align-items:center; justify-content:center;
+  transition:background .15s, transform .15s;
+  z-index:2;
+}
+.carousel-arrow:hover { background:rgba(56,189,248,.45); transform:translateY(-50%) scale(1.05); }
+.carousel-arrow:active { transform:translateY(-50%) scale(.95); }
+.carousel-arrow.prev { left:24px; }
+.carousel-arrow.next { right:24px; }
+.carousel-arrow:disabled { opacity:.25; cursor:not-allowed; }
+
+.carousel-info {
+  position:absolute; bottom:24px; left:50%; transform:translateX(-50%);
+  padding:8px 16px; background:rgba(20,24,32,.78); color:#fff;
+  border-radius:20px; font-size:13px;
+  display:flex; gap:14px; align-items:center;
+  backdrop-filter:blur(6px);
+}
+.carousel-counter { font-weight:700; }
+.carousel-time    { color:#9aa6b2; }
+
+.carousel-close {
+  position:absolute; top:18px; right:24px;
+  width:44px; height:44px; border-radius:50%;
+  background:rgba(20,24,32,.78); color:#fff; border:none;
+  font-size:20px; cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+  z-index:2;
+}
+.carousel-close:hover { background:rgba(239,68,68,.4); }
+
 .modal {
   display: none; position: fixed; z-index: 1000; padding-top: 60px;
   left: 0; top: 0; width: 100%; height: 100%; overflow: auto;
@@ -117,23 +257,161 @@ body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui
   <div class="empty">Loading snapshots…</div>
 </div>
 
+<!-- ─── Visitor-expand modal (one per visitor, click tile → all snapshots) ─── -->
+<div id="visitorModal" class="visitor-modal" onclick="closeVisitorModal()">
+  <div class="vm-body" onclick="event.stopPropagation()">
+    <div class="vm-header">
+      <div>
+        <div class="vm-title" id="vm-title">Visitor</div>
+        <div class="vm-meta"  id="vm-meta">—</div>
+      </div>
+      <button class="vm-close" onclick="closeVisitorModal()">Close ✕</button>
+    </div>
+    <div class="vm-grid" id="vm-grid"></div>
+  </div>
+</div>
+
+<!-- ─── Layer 3 — Full-screen carousel for a visitor's snapshots ─── -->
+<div id="carouselModal" class="carousel-modal" onclick="closeCarousel()">
+  <button class="carousel-arrow prev" aria-label="Previous"
+          onclick="event.stopPropagation(); carouselPrev()">‹</button>
+
+  <div class="carousel-stage" onclick="event.stopPropagation()">
+    <img id="carousel-img" class="carousel-img" alt="snapshot">
+  </div>
+
+  <button class="carousel-arrow next" aria-label="Next"
+          onclick="event.stopPropagation(); carouselNext()">›</button>
+
+  <div class="carousel-info" onclick="event.stopPropagation()">
+    <span class="carousel-counter" id="carousel-counter">0 / 0</span>
+    <span class="carousel-time"    id="carousel-time">—</span>
+  </div>
+
+  <button class="carousel-close" onclick="closeCarousel()" aria-label="Close">✕</button>
+</div>
+
 <div id="imgModal" class="modal" onclick="closeModal()">
   <span class="modal-close" onclick="closeModal()">&times;</span>
   <img class="modal-content" id="modalImg" onclick="event.stopPropagation()">
 </div>
 
 <script>
+/* friendlyDate labels groups relative to the BUSINESS day the server
+ * reports. At 08:50 IST the business day is still yesterday's
+ * calendar date — without using the server's hint the UI would show
+ * today's snapshots under "Yesterday" which is confusing. The
+ * `_businessToday` global is refreshed on every loadSnaps() call. */
+let _businessToday = null;
 function friendlyDate(ds) {
-  const today = new Date(); today.setHours(0,0,0,0);
-  const yest  = new Date(today); yest.setDate(yest.getDate()-1);
-  const d     = new Date(ds);    d.setHours(0,0,0,0);
+  if (!_businessToday) return ds;
+  const today = new Date(_businessToday + 'T00:00:00');
+  const yest  = new Date(today); yest.setDate(yest.getDate() - 1);
+  const d     = new Date(ds + 'T00:00:00');
   if (d.getTime() === today.getTime()) return 'Today';
   if (d.getTime() === yest.getTime())  return 'Yesterday';
   return ds;
 }
 
+/* Render a single snapshot card.
+ *
+ * ``contextKey`` and ``idx`` together tell the carousel which sequence
+ * to cycle through (looked up via _visitorIndex). When set, clicking
+ * the photo OR the View button opens the full-screen carousel at this
+ * index — same UX everywhere in the gallery.
+ *
+ * If contextKey is null we fall back to the simple imgModal — used for
+ * any path that doesn't yet stash its snap list into _visitorIndex.
+ */
+/* Render a single snapshot card.
+ *
+ * The click handlers used to be inlined as ``onclick="..."`` strings.
+ * That breaks the moment the JS contains a double-quote (e.g.
+ * ``openCarousel("2026-05-15#0", 2)``), because the inner ``"`` clashes
+ * with the attribute's outer ``"`` and the browser parses garbage —
+ * which is exactly why the carousel "did nothing" when clicked.
+ *
+ * Fix: data-attributes + a single delegated click listener (registered
+ * once below). No string-escaping headaches, robust to any contextKey
+ * that could contain weird characters, and easier to extend later. */
+function renderCard(s, contextKey, idx) {
+  const label = s.visitor_type || 'Unknown';
+  const ts    = s.timestamp   || '';
+  // The card carries either (key, idx) for the carousel path OR
+  // a filename for the legacy openModal fallback.
+  const dataAttrs = (contextKey != null && idx != null)
+    ? `data-snap-key="${String(contextKey).replace(/"/g, '&quot;')}" data-snap-idx="${idx}"`
+    : `data-snap-file="${String(s.filename).replace(/"/g, '&quot;')}"`;
+  return `
+    <div class="card snap-card" ${dataAttrs}>
+      <img class="snap-thumb" src="/snapshots/${s.filename}" alt="${s.filename}"
+           style="cursor:pointer;"
+           onerror="this.style.background='var(--border)';this.src=''">
+      <div class="card-body">
+        <div class="card-title">${label} Detection</div>
+        <div class="card-sub">${ts}</div>
+        <div class="actions">
+          <button class="btn snap-view-btn">View</button>
+          <a class="btn" href="/snapshots/${s.filename}" download
+             onclick="event.stopPropagation()">Download</a>
+          <button class="btn danger snap-del-btn" data-snap-id="${s.id}">Delete</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* Single delegated click listener for every snapshot card.
+ *
+ * Replaces the broken-by-quoting inline onclick handlers. The listener
+ * runs once at script load (registration is below loadSnaps definition)
+ * and walks the DOM up from the click target to find:
+ *
+ *   • .snap-thumb or .snap-view-btn   → open the carousel (or legacy modal)
+ *   • .snap-del-btn                   → delete the snap
+ */
+function _onGalleryClick(e) {
+  // Delete: priority over open (button is the deepest child)
+  const del = e.target.closest('.snap-del-btn');
+  if (del) {
+    e.stopPropagation();
+    const id = parseInt(del.dataset.snapId, 10);
+    if (!isNaN(id)) delSnap(id);
+    return;
+  }
+  // Photo or View → carousel / fallback modal
+  const opener = e.target.closest('.snap-thumb, .snap-view-btn');
+  if (!opener) return;
+  const card = opener.closest('.snap-card');
+  if (!card) return;
+  e.stopPropagation();
+  const key = card.dataset.snapKey;
+  const idx = parseInt(card.dataset.snapIdx, 10);
+  if (key && !isNaN(idx)) {
+    openCarousel(key, idx);
+    return;
+  }
+  const file = card.dataset.snapFile;
+  if (file) openModal('/snapshots/' + file);
+}
+/* Capture phase (third arg = true) is critical: the visitor modal's
+ * .vm-body has ``onclick="event.stopPropagation()"`` to prevent clicks
+ * inside it from closing the modal. That stops BUBBLE-phase propagation
+ * before the click can reach a bubble-phase listener on `document`.
+ *
+ * Capture phase fires from document DOWN to the target — i.e., BEFORE
+ * any element along the path can call stopPropagation — so our
+ * delegated handler always sees the click. */
+document.addEventListener('click', _onGalleryClick, true);
+
+/* Per-page index keyed by ``${date}#${visitor_id}`` so the modal can
+ * grab the right list of snapshots when the user clicks a tile. We
+ * refill this on every loadSnaps() so it stays in lock-step with the
+ * gallery DOM. */
+const _visitorIndex = new Map();
+
 async function loadSnaps() {
   const res = await fetch('/api/snapshots/daywise').then(r => r.json());
+  _businessToday = res.current_business_day || null;
   const content = document.getElementById('content');
   const entries = Object.entries(res.grouped || {});
 
@@ -142,48 +420,184 @@ async function loadSnaps() {
     return;
   }
 
+  _visitorIndex.clear();
   let html = '';
-  for (const [date, snaps] of entries) {
-    const visitorCount  = snaps.filter(s => (s.visitor_type||'').toLowerCase() !== 'manual').length;
-    const manualCount   = snaps.filter(s => (s.visitor_type||'').toLowerCase() === 'manual').length;
+  for (const [date, day] of entries) {
+    const visitors  = day.visitors  || [];
+    const ungrouped = day.ungrouped || [];
+    const totalSnaps = visitors.reduce((n, v) => n + v.count, 0) + ungrouped.length;
 
     html += `
       <div class="day-block">
         <div class="day-header">
           <div class="day-title">${friendlyDate(date)}</div>
           <div class="day-stats">
-            <div class="day-stat">Snapshots: <span class="day-stat-n">${snaps.length}</span></div>
-            <div class="day-stat">Auto: <span class="day-stat-n">${visitorCount}</span></div>
-            <div class="day-stat">Manual: <span class="day-stat-n">${manualCount}</span></div>
-            <button class="btn danger" style="padding:4px 10px; margin-left:10px" onclick="delAllSnaps('${date}')">Delete All</button>
+            <div class="day-stat">Visitors: <span class="day-stat-n">${visitors.length}</span></div>
+            <div class="day-stat">Snapshots: <span class="day-stat-n">${totalSnaps}</span></div>
+            <button class="btn danger" style="padding:4px 10px; margin-left:10px"
+                    onclick="event.stopPropagation(); delAllSnaps('${date}')">Delete All</button>
           </div>
         </div>
-        <div class="grid">
-          ${snaps.map(s => {
-            const label = s.visitor_type || 'Unknown';
-            const ts    = s.timestamp   || '';
-            const time  = ts.split(' ')[1] || ts;
-            return `
-              <div class="card">
-                <img src="/snapshots/${s.filename}" alt="${s.filename}" style="cursor:pointer;"
-                     onerror="this.style.background='var(--border)';this.src=''"
-                     onclick="openModal('/snapshots/${s.filename}')">
-                <div class="card-body">
-                  <div class="card-title">${label} Detection</div>
-                  <div class="card-sub">${ts}</div>
-                  <div class="actions">
-                    <button class="btn" onclick="openModal('/snapshots/${s.filename}')">View</button>
-                    <a class="btn" href="/snapshots/${s.filename}" download>Download</a>
-                    <button class="btn danger" onclick="delSnap(${s.id})">Delete</button>
-                  </div>
-                </div>
-              </div>`;
-          }).join('')}
-        </div>
-      </div>`;
+        <div class="visitors-grid">`;
+
+    /* One tile per visitor. The "cover" image is the FIRST snapshot we
+     * have for that person (oldest → most natural "this is what they
+     * looked like when they arrived"). All their snapshots are loaded
+     * into the modal that opens on click. */
+    for (const v of visitors) {
+      _visitorIndex.set(`${date}#${v.visitor_id}`, { date, visitor: v });
+      const cover = v.snaps[0] || {};
+      const firstTime = (v.first_seen || '').split(' ')[1] || '';
+      const lastTime  = (v.last_seen  || '').split(' ')[1] || '';
+      const window    = firstTime === lastTime
+        ? firstTime
+        : `${firstTime} → ${lastTime}`;
+      html += `
+        <div class="visitor-tile" onclick="openVisitorModal('${date}', ${v.visitor_id})">
+          <span class="visitor-tile-badge">${v.count} snap${v.count === 1 ? '' : 's'}</span>
+          <img src="/snapshots/${cover.filename}" alt="${v.label}"
+               onerror="this.style.background='var(--border)'; this.src=''">
+          <div class="visitor-tile-info">
+            <div>
+              <div class="visitor-tile-name">${v.label}</div>
+              <div class="visitor-tile-meta">${window}</div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    html += `</div>`;  // close .visitors-grid
+
+    /* Ungrouped / legacy rows still need to be reachable — render
+     * them as a compact secondary strip beneath the visitor tiles.
+     * No visitor_id, but we still want the carousel + arrow-key
+     * experience, so stash the list under a synthetic key. */
+    if (ungrouped.length) {
+      const ungroupedKey = `${date}#__ungrouped__`;
+      _visitorIndex.set(ungroupedKey, {
+        date,
+        visitor: {
+          label: "Other snapshots",
+          count: ungrouped.length,
+          first_seen: ungrouped[ungrouped.length - 1]?.timestamp || '',
+          last_seen:  ungrouped[0]?.timestamp || '',
+          snaps: ungrouped,
+        },
+      });
+      html += `
+        <div class="misc-strip">
+          <div class="misc-label">Other snapshots (manual / pre-grouping) · ${ungrouped.length}</div>
+          <div class="grid">
+            ${ungrouped.map((s, i) => renderCard(s, ungroupedKey, i)).join('')}
+          </div>
+        </div>`;
+    }
+
+    html += `</div>`;  // close .day-block
   }
   content.innerHTML = html;
 }
+
+/* ── Visitor-expand modal ───────────────────────────────────────────────── */
+
+function openVisitorModal(date, visitorId) {
+  const entry = _visitorIndex.get(`${date}#${visitorId}`);
+  if (!entry) return;
+  const v = entry.visitor;
+  document.getElementById('vm-title').textContent = v.label || `Visitor #${visitorId + 1}`;
+  document.getElementById('vm-meta').textContent =
+    `${v.count} snapshot${v.count === 1 ? '' : 's'} · ` +
+    `${friendlyDate(date)} · ${(v.first_seen || '').split(' ')[1] || '?'} → ` +
+    `${(v.last_seen || '').split(' ')[1] || '?'}`;
+
+  /* Re-render every card via the shared ``renderCard`` so the
+   * carousel hook is identical in the visitor modal and the
+   * ungrouped strip. Each card's click → openCarousel(key, idx). */
+  const key = `${date}#${visitorId}`;
+  document.getElementById('vm-grid').innerHTML =
+    v.snaps.map((s, i) => renderCard(s, key, i)).join('');
+
+  document.getElementById('visitorModal').classList.add('open');
+}
+
+function closeVisitorModal() {
+  document.getElementById('visitorModal').classList.remove('open');
+}
+
+/* ── Layer 3 — Full-screen carousel state + handlers ─────────────────────
+ *
+ * Carousel is keyed off any entry in ``_visitorIndex`` (visitor blocks
+ * AND the ungrouped strip both register themselves there). The current
+ * index is held in module scope so keyboard arrows advance it without
+ * a re-lookup on every keypress.
+ *
+ * Public entry: ``openCarousel(key, idx)``. The ``key`` is whatever
+ * was stored in ``_visitorIndex`` — either ``${date}#${visitor_id}``
+ * (real visitor) or ``${date}#__ungrouped__`` (manual/legacy strip).
+ */
+const _carousel = { key: null, idx: 0 };
+
+function _carouselSnaps() {
+  if (!_carousel.key) return [];
+  const entry = _visitorIndex.get(_carousel.key);
+  // Both visitor entries and the synthetic ungrouped entry stash
+  // their list under `.visitor.snaps` — see loadSnaps.
+  return entry ? (entry.visitor.snaps || []) : [];
+}
+
+function _renderCarousel() {
+  const snaps = _carouselSnaps();
+  if (!snaps.length) { closeCarousel(); return; }
+  if (_carousel.idx < 0) _carousel.idx = snaps.length - 1;
+  if (_carousel.idx >= snaps.length) _carousel.idx = 0;
+  const s = snaps[_carousel.idx];
+  const img = document.getElementById('carousel-img');
+  img.src = '/snapshots/' + s.filename;
+  document.getElementById('carousel-counter').textContent =
+    `${_carousel.idx + 1} / ${snaps.length}`;
+  document.getElementById('carousel-time').textContent = s.timestamp || '';
+}
+
+function openCarousel(key, idx) {
+  _carousel.key = key;
+  _carousel.idx = Math.max(0, idx | 0);
+  _renderCarousel();
+  document.getElementById('carouselModal').classList.add('open');
+}
+
+function closeCarousel() {
+  document.getElementById('carouselModal').classList.remove('open');
+  _carousel.key = null;
+}
+
+function carouselPrev() {
+  const n = _carouselSnaps().length;
+  if (!n) return;
+  _carousel.idx = (_carousel.idx - 1 + n) % n;    // wraps backward
+  _renderCarousel();
+}
+
+function carouselNext() {
+  const n = _carouselSnaps().length;
+  if (!n) return;
+  _carousel.idx = (_carousel.idx + 1) % n;        // wraps forward
+  _renderCarousel();
+}
+
+/* Keyboard:
+ *   • Carousel open  → ← / → cycle, Esc closes carousel
+ *   • Visitor modal open (no carousel) → Esc closes visitor modal
+ * Listener is registered ONCE at module load. */
+document.addEventListener('keydown', (e) => {
+  const carouselOpen = document.getElementById('carouselModal').classList.contains('open');
+  if (carouselOpen) {
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); carouselPrev(); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); carouselNext(); return; }
+    if (e.key === 'Escape')     { closeCarousel(); return; }
+    return;
+  }
+  if (e.key === 'Escape') closeVisitorModal();
+});
 
 async function delAllSnaps(date) {
   if (!confirm('Delete all snapshots for ' + friendlyDate(date) + '?')) return;

@@ -1,6 +1,8 @@
 """Control routes — system, voice, mode, camera, video feed, and main page."""
 
-import datetime
+import json
+import queue
+import time
 
 import cv2
 import numpy as np
@@ -9,6 +11,11 @@ from flask import Blueprint, Response, current_app, jsonify, render_template, re
 from backend.core.constants import EV_VOICE_COMMAND
 
 bp = Blueprint("control", __name__)
+
+# How long the SSE generator waits before sending a keep-alive comment.
+# Some HTTP intermediaries close connections idle for >30s; 15s is a
+# safe interval that's invisible to the browser.
+SSE_KEEPALIVE_SECONDS: float = 15.0
 
 
 def _registry():
@@ -81,6 +88,65 @@ def index():
     return render_template("index.html")
 
 
+# ── Real-time push (Server-Sent Events) ──────────────────────────────────────────
+#
+# The dashboard's polling /api/status is still served — it stays as a
+# fallback. /api/events is the new push channel:
+#
+#   • On connect, we send one ``snapshot`` event containing the full
+#     current state so the UI is populated immediately.
+#   • Every time the bridge mutates state (visitor, presence, camera_status),
+#     we receive a small delta dict via our subscriber queue and stream it
+#     out as a single ``data: {...}\n\n`` line.
+#   • Every 15 s of silence we emit a ``:`` comment line as a keep-alive
+#     so HTTP intermediaries don't close the idle connection.
+#
+# The subscriber queue is registered/unregistered via bridge.subscribe()
+# and bridge.unsubscribe(); the ``finally`` block guarantees cleanup even
+# when the browser tab is closed.
+
+@bp.route("/api/events")
+def api_events():
+    reg = _registry()
+    bridge = reg.get("mqtt_bridge")
+    state = reg.get("state")
+    if bridge is None or state is None:
+        return Response("bridge not available", status=503)
+
+    q = bridge.subscribe()
+
+    def _stream():
+        try:
+            # Initial full snapshot so the dashboard renders immediately
+            # without waiting for the first delta event.
+            initial = {"type": "snapshot", **state.snapshot()}
+            yield f"data: {json.dumps(initial, default=str)}\n\n"
+
+            while True:
+                try:
+                    msg = q.get(timeout=SSE_KEEPALIVE_SECONDS)
+                    yield f"data: {json.dumps(msg, default=str)}\n\n"
+                except queue.Empty:
+                    # Idle keep-alive — colon-prefixed comment, ignored
+                    # by EventSource. Defeats proxy idle timeouts.
+                    yield f": ping {int(time.time())}\n\n"
+        except GeneratorExit:
+            # Browser closed the tab — exit cleanly.
+            pass
+        finally:
+            bridge.unsubscribe(q)
+
+    return Response(
+        _stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",   # disable proxy buffering (nginx)
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ── Status API ────────────────────────────────────────────────────────────────────
 
 @bp.route("/api/status")
@@ -107,17 +173,6 @@ def api_status():
         "last_visitor_b64":     s.get("last_visitor_b64", ""),
         "ai_alert":             s.get("ai_alert", ""),
     })
-
-
-@bp.route("/api/log")
-def api_log():
-    try:
-        from backend.config.settings import LOG_FILE
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        lines = [l.strip() for l in open(LOG_FILE) if today in l][-30:]
-        return jsonify({"lines": list(reversed(lines))})
-    except Exception:
-        return jsonify({"lines": []})
 
 
 # ── Control API ───────────────────────────────────────────────────────────────────
@@ -239,6 +294,107 @@ def api_camera_snapshot():
     if automation:
         automation.take_snapshot()
     return jsonify({"ok": True})
+
+
+# ── Entry-zone polygon (greeting gate) ───────────────────────────────────────────
+#
+# GET  /api/zone — returns the currently-stored normalized polygon (or
+#                  ``{"polygon": []}`` if none has been configured yet).
+# POST /api/zone — body: ``{"polygon": [[x,y], [x,y], ...]}`` with all
+#                  coords in [0.0, 1.0]. Writes to ``zone_config.json``
+#                  atomically and tells VisionService to hot-reload so
+#                  the change is live with no restart.
+#
+# The polygon is stored normalized so it survives stream resolution
+# changes — the very point of the spec. Coords are validated server-side;
+# a malformed payload returns 400 without touching the on-disk file.
+
+@bp.route("/api/zone", methods=["GET"])
+def api_zone_get():
+    import os
+    from backend.config.settings import ZONE_CONFIG_FILE
+    if not os.path.exists(ZONE_CONFIG_FILE):
+        return jsonify({"polygon": []})
+    try:
+        with open(ZONE_CONFIG_FILE) as f:
+            data = json.load(f)
+        polygon = data.get("polygon", [])
+        if not isinstance(polygon, list):
+            polygon = []
+        return jsonify({"polygon": polygon})
+    except Exception:
+        return jsonify({"polygon": []})
+
+
+@bp.route("/api/zone", methods=["POST"])
+def api_zone_post():
+    import os
+    import tempfile
+    from backend.config.settings import ZONE_CONFIG_FILE
+
+    data = request.get_json(silent=True) or {}
+    polygon_in = data.get("polygon", [])
+    if not isinstance(polygon_in, list):
+        return jsonify({"ok": False, "error": "polygon must be a list"}), 400
+
+    # Validate every point: must be [x, y] with x,y in [0, 1].
+    cleaned = []
+    for pt in polygon_in:
+        if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
+            return jsonify({"ok": False, "error": "each point must be [x, y]"}), 400
+        x, y = pt
+        if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
+            return jsonify({"ok": False, "error": "coords must be numeric"}), 400
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            return jsonify(
+                {"ok": False, "error": "coords must be normalized [0, 1]"}
+            ), 400
+        cleaned.append([float(x), float(y)])
+
+    # An empty polygon is allowed — it means "clear the zone, greet
+    # everywhere". 1- or 2-point polygons are rejected because they
+    # can't enclose anything; VisionService would treat them as empty
+    # anyway but the server-side validation gives a clearer 400.
+    if 0 < len(cleaned) < 3:
+        return jsonify(
+            {"ok": False, "error": "polygon must have at least 3 points (or be empty)"}
+        ), 400
+
+    payload = {"polygon": cleaned, "version": 1}
+
+    # Atomic write — same recipe as StateManager / DailyFaceCache so a
+    # crash mid-flush can't leave a half-written JSON.
+    try:
+        dir_name = os.path.dirname(ZONE_CONFIG_FILE) or "."
+        os.makedirs(dir_name, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".zone_config.", suffix=".tmp", dir=dir_name,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, ZONE_CONFIG_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        current_app.logger.exception("zone save failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    # Hot-reload VisionService so the change is live immediately.
+    vision = _registry().get("vision")
+    if vision is not None:
+        try:
+            vision.reload_zone()
+        except Exception:
+            current_app.logger.exception("vision.reload_zone failed")
+
+    return jsonify({"ok": True, "points": len(cleaned)})
 
 
 # ── First-time wipe (dashboard "START SYSTEM FIRST TIME" button) ─────────────────

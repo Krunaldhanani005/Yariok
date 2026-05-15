@@ -34,7 +34,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date
-from typing import List, Optional, Set
+from typing import Iterable, List, Optional
 
 import cv2
 import faiss
@@ -48,11 +48,32 @@ _PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.dirname(
 )))
 _DEFAULT_IDENTITY_FILE: str = os.path.join(_PROJECT_ROOT, "daily_identity.pkl")
 
-# Recency window: a body-score that's below the strict threshold but
-# above the recency threshold is accepted as a match if the candidate
-# visitor was last seen within this many seconds. Rationale: real-world
-# CCTV re-IDs of the same person within ~30s (same lighting, same room)
-# tolerate a much looser body-color match than re-IDs across hours.
+# ── Dual-signal agreement thresholds ─────────────────────────────────────
+#
+# Replaces the prior "any single signal above its own threshold wins"
+# logic. The old scheme made false MERGES easy: two strangers in
+# similar shirts could exceed RECENCY_BODY_THRESHOLD=0.40 alone and end
+# up sharing a visitor_id. The new scheme requires that EITHER:
+#
+#   C1 — face alone is decisive            (face_cosine ≥ 0.55)
+#   C2 — face confirms a strong body match (body ≥ 0.65 AND face ≥ 0.30)
+#   C3 — body alone is exceptionally strong (body ≥ 0.85)
+#
+# Anything below all three → no match → new visitor_id → fresh gallery.
+# Self-correcting: each false-split's library stays clean, so future
+# matching becomes more reliable, not less.
+FACE_SURE_THRESHOLD:   float = 0.45   # C1 — was 0.55; lowered because
+                                       # forensic analysis of real CCTV
+                                       # traffic showed same-person ArcFace
+                                       # cosines reliably land in 0.45–0.55,
+                                       # producing false-splits at 0.55.
+BODY_CORROB_THRESHOLD: float = 0.65   # C2 body floor
+FACE_HINT_THRESHOLD:   float = 0.30   # C2 face floor
+BODY_SURE_THRESHOLD:   float = 0.85   # C3
+
+# Legacy constants — kept for backward compat with tests and the
+# DailyFaceCache constructor signature, but the search() method now
+# applies the dual-signal rule above instead.
 RECENCY_WINDOW_SECONDS: float = 120.0
 RECENCY_BODY_THRESHOLD: float = 0.40
 
@@ -112,10 +133,23 @@ class DailyFaceCache:
         # under varying lighting.
         self._body_hists: List[List[np.ndarray]] = []
         self._last_seen: List[float] = []   # monotonic timestamp per visitor
+        # Wall-clock (Unix epoch) timestamp of the LAST snapshot we
+        # actually saved for each visitor. Drives the 10-minute
+        # per-visitor cooldown for refresh snapshots. Stored as wall
+        # clock (not monotonic) so the cooldown survives process
+        # restarts correctly — a visitor we snapshotted 8 minutes
+        # before a crash is still on cooldown 2 minutes after recovery.
+        self._last_snapshot_at: List[float] = []
         self._max_views_per_visitor: int = 8
 
-        # ── Session-wide track gate ──────────────────────────────────────
-        self.known_bot_sort_ids: Set[int] = set()
+        # ── Session-wide track → visitor binding ─────────────────────────
+        # Was: a Set[int] of "known" track ids. Now a Dict[int, int]
+        # mapping each resolved track_id to the visitor_id it belongs
+        # to. That mapping is what powers the co-occurrence exclusion
+        # rule: "if track A is bound to visitor #2 and is currently in
+        # frame, track B (a different person in the same frame) MUST
+        # NOT be allowed to match visitor #2."
+        self.known_bot_sort_ids: dict = {}   # Dict[int, int]: track_id → visitor_id
 
         logger.info(
             "DailyFaceCache initialized — face_thresh=%.2f body_thresh=%.2f",
@@ -164,96 +198,114 @@ class DailyFaceCache:
         self,
         face_embedding: Optional[np.ndarray] = None,
         body_hist: Optional[np.ndarray] = None,
+        excluded_visitor_ids: Optional[Iterable[int]] = None,
     ) -> FaceMatch:
-        """Look up an identity. Returns the first decisive match.
+        """Look up an identity using the dual-signal agreement rule.
 
-        Order of evaluation:
-            1. Body histogram (linear scan, very cheap, always available).
-               Most CCTV-induced false-new visitors are caught here.
-            2. Face FAISS (sub-millisecond) — picks up cases where the
-               person changed jacket / turned away from the camera.
+        Compared to the previous "any single signal above its own
+        threshold wins" rule, this implementation requires that one of:
 
-        If neither modality crosses its threshold, returns an unmatched
-        FaceMatch (caller treats as new visitor).
+            C1 — face_cosine     ≥ FACE_SURE_THRESHOLD   (0.55)
+            C2 — body_score      ≥ BODY_CORROB_THRESHOLD (0.65)
+                 AND face_cosine ≥ FACE_HINT_THRESHOLD   (0.30)
+            C3 — body_score      ≥ BODY_SURE_THRESHOLD   (0.85)
+
+        be true for the BEST candidate. The old "recency body 0.40"
+        path is gone — its false-merge risk outweighed its benefit.
+
+        ``excluded_visitor_ids`` enforces the co-occurrence exclusivity
+        rule: any visitor_id passed here is removed from the candidate
+        pool BEFORE the rule check. The caller (vision worker) sets
+        this to the union of visitor_ids currently bound to other
+        active tracks, so two people simultaneously in frame can never
+        be merged.
         """
-        best_body_score: float = -1.0
-        best_body_visitor: int = -1
-        best_face_score: float = 0.0
-        now = time.monotonic()
+        excluded: set = (
+            {int(v) for v in excluded_visitor_ids}
+            if excluded_visitor_ids else set()
+        )
+
+        # candidates[vid] = [body_score, face_score]
+        candidates: dict = {}
 
         with self._lock:
-            # ── 1) Body match ────────────────────────────────────────────
-            # Two-tier acceptance:
-            #   strict :  ≥ self._body_threshold   (default 0.70)
-            #   recency:  ≥ RECENCY_BODY_THRESHOLD (default 0.40)
-            #             AND visitor was last seen < 45s ago
-            # The recency tier catches the common CCTV failure mode
-            # where the same person turns around within a few seconds
-            # and their back-of-clothing histogram drops to ~0.5.
+            # ── Body scores (linear scan, max across each visitor's library) ──
             if body_hist is not None and self._body_hists:
                 q_body = body_hist.astype(np.float32)
-
-                # Per visitor we keep a LIBRARY of body views (one per
-                # distinct pose) — take the MAX correlation across all
-                # stored views as that visitor's score. This handles
-                # the natural HSV drift of the same person turning /
-                # moving under varying light.
-                best_recent_score, best_recent_visitor = -1.0, -1
                 for vid, library in enumerate(self._body_hists):
-                    if not library:
+                    if vid in excluded or not library:
                         continue
                     v_best = max(
                         float(cv2.compareHist(q_body, h.astype(np.float32),
                                               cv2.HISTCMP_CORREL))
                         for h in library
                     )
-                    if v_best > best_body_score:
-                        best_body_score, best_body_visitor = v_best, vid
-                    if (v_best >= RECENCY_BODY_THRESHOLD
-                        and (now - self._last_seen[vid]) <= RECENCY_WINDOW_SECONDS
-                        and v_best > best_recent_score):
-                        best_recent_score, best_recent_visitor = v_best, vid
+                    candidates.setdefault(vid, [-1.0, -1.0])[0] = v_best
 
-                # Strict match always wins.
-                if best_body_visitor >= 0 and best_body_score >= self._body_threshold:
-                    self._last_seen[best_body_visitor] = now
-                    self._append_view(best_body_visitor, body_hist)
-                    return FaceMatch(
-                        True, best_body_score, best_body_visitor, "body",
-                        body_score=best_body_score, face_score=best_face_score,
-                    )
-                # Otherwise: any recent visitor that crossed the relaxed bound.
-                if best_recent_visitor >= 0:
-                    self._last_seen[best_recent_visitor] = now
-                    self._append_view(best_recent_visitor, body_hist)
-                    return FaceMatch(
-                        True, best_recent_score, best_recent_visitor, "body-recent",
-                        body_score=best_recent_score, face_score=best_face_score,
-                    )
-
-            # ── 2) Face match (FAISS IP search) ──────────────────────────
+            # ── Face scores (FAISS top-k where k = total face rows so we
+            #    get the best hit PER visitor and can exclude rows whose
+            #    visitor is in the co-occurrence exclusion set) ────────
             if face_embedding is not None and self._face_index.ntotal > 0:
                 q = self.l2_normalize(face_embedding).reshape(1, -1).astype(np.float32)
-                scores, rows = self._face_index.search(q, k=1)
-                best_face_score = float(scores[0][0])
-                top_row = int(rows[0][0])
-                if best_face_score >= self._face_threshold:
-                    visitor_id = self._face_row_to_visitor[top_row]
-                    self._last_seen[visitor_id] = now
-                    if body_hist is not None:
-                        self._append_view(visitor_id, body_hist)
-                    return FaceMatch(
-                        True, best_face_score, visitor_id, "face",
-                        body_score=best_body_score, face_score=best_face_score,
-                    )
+                k = int(self._face_index.ntotal)
+                scores, rows = self._face_index.search(q, k=k)
+                for s, r in zip(scores[0], rows[0]):
+                    if r < 0:
+                        continue
+                    vid = self._face_row_to_visitor[int(r)]
+                    if vid in excluded:
+                        continue
+                    cur = candidates.setdefault(vid, [-1.0, -1.0])
+                    f = float(s)
+                    if f > cur[1]:
+                        cur[1] = f
 
-        # No decisive match. Surface both scores so the caller can log
-        # body_score=X face_score=Y and tune thresholds from real data.
-        miss_score = best_body_score if best_body_score >= 0 else best_face_score
-        return FaceMatch(
-            False, miss_score, -1, "miss",
-            body_score=best_body_score, face_score=best_face_score,
-        )
+            # ── Apply the three rules in priority order ──────────────────
+            # C1 > C2 > C3 by tier; inside each tier, sort by the
+            # dominant score (face for C1, body for C2/C3).
+            c1: list = []
+            c2: list = []
+            c3: list = []
+            for vid, (b, f) in candidates.items():
+                if f >= FACE_SURE_THRESHOLD:
+                    c1.append((vid, b, f))
+                elif b >= BODY_CORROB_THRESHOLD and f >= FACE_HINT_THRESHOLD:
+                    c2.append((vid, b, f))
+                elif b >= BODY_SURE_THRESHOLD:
+                    c3.append((vid, b, f))
+
+            chosen = None  # (vid, body_score, face_score, kind, primary_score)
+            if c1:
+                c1.sort(key=lambda x: -x[2])   # highest face wins
+                vid, b, f = c1[0]
+                chosen = (vid, b, f, "face", f)
+            elif c2:
+                c2.sort(key=lambda x: -x[1])   # highest body wins
+                vid, b, f = c2[0]
+                chosen = (vid, b, f, "body+face", b)
+            elif c3:
+                c3.sort(key=lambda x: -x[1])
+                vid, b, f = c3[0]
+                chosen = (vid, b, f, "body-strict", b)
+
+            if chosen is not None:
+                vid, b, f, kind, primary = chosen
+                self._last_seen[vid] = time.monotonic()
+                if body_hist is not None:
+                    self._append_view(vid, body_hist)
+                return FaceMatch(
+                    matched=True, score=primary, index=vid, kind=kind,
+                    body_score=b, face_score=f,
+                )
+
+            # No candidate passed any rule. Surface the best-seen
+            # scores so the caller can log them and tune thresholds.
+            best_b = max((b for b, _ in candidates.values()), default=-1.0)
+            best_f = max((f for _, f in candidates.values()), default=0.0)
+            return FaceMatch(
+                matched=False, score=max(best_b, best_f), index=-1, kind="miss",
+                body_score=best_b, face_score=best_f,
+            )
 
     def add_visitor(
         self,
@@ -268,6 +320,10 @@ class DailyFaceCache:
                 library.append(body_hist.astype(np.float32).copy())
             self._body_hists.append(library)
             self._last_seen.append(time.monotonic())
+            # The "first sighting" is itself a snapshot moment, so seed
+            # last_snapshot_at to now. This means the 10-min cooldown
+            # starts counting from the FIRST snapshot, not from zero.
+            self._last_snapshot_at.append(time.time())
             if face_embedding is not None:
                 vec = self.l2_normalize(face_embedding).reshape(1, -1).astype(np.float32)
                 self._face_index.add(vec)
@@ -295,30 +351,106 @@ class DailyFaceCache:
         with self._lock:
             self._append_view(visitor_id, body_hist)
 
+    # ── Snapshot cooldown ────────────────────────────────────────────────
+
+    def time_since_snapshot(self, visitor_id: int) -> float:
+        """Seconds elapsed since this visitor's last snapshot.
+
+        Returns ``float("inf")`` if the visitor id is unknown, so the
+        cooldown check naturally evaluates as "long past cooldown" for
+        bogus ids — same behaviour as a brand-new visitor.
+        """
+        with self._lock:
+            if 0 <= visitor_id < len(self._last_snapshot_at):
+                return max(0.0, time.time() - self._last_snapshot_at[visitor_id])
+        return float("inf")
+
+    def mark_snapshot(self, visitor_id: int) -> None:
+        """Record that we just took a snapshot for this visitor.
+
+        Called by the vision worker when it commits a snapshot (either
+        a first-sighting capture or a refresh after the cooldown has
+        elapsed). Persists immediately so the cooldown survives a
+        crash mid-day.
+        """
+        with self._lock:
+            if 0 <= visitor_id < len(self._last_snapshot_at):
+                self._last_snapshot_at[visitor_id] = time.time()
+                self._save_to_disk_locked()
+
     # ── Track-ID gate (Gate 1 in vision_service) ─────────────────────────
 
-    def mark_track_known(self, track_id: int) -> None:
+    def mark_track_known(self, track_id: int, visitor_id: int) -> None:
+        """Bind a BoT-SORT track id to its resolved visitor id.
+
+        Used by the worker as the FINAL step of identity resolution.
+        The mapping powers two things:
+          - Gate 1 in the camera thread (is_track_known)
+          - The co-occurrence exclusion in :meth:`visitor_ids_for_tracks`
+        """
         with self._lock:
-            self.known_bot_sort_ids.add(int(track_id))
+            self.known_bot_sort_ids[int(track_id)] = int(visitor_id)
 
     def is_track_known(self, track_id: int) -> bool:
         with self._lock:
             return int(track_id) in self.known_bot_sort_ids
 
+    def known_track_ids_snapshot(self) -> set:
+        """Return a lock-protected snapshot of all currently-bound track ids.
+
+        Used by the inference loop to compute the co-visible "eligible"
+        pool — a track that's already been resolved (bound to a
+        visitor) is always trustworthy for exclusion, even if its
+        stability count hasn't crossed the recent-frames threshold yet.
+        Without this safeguard, two strangers walking in on the same
+        frame could merge: neither track is "stable" until frame 2+,
+        so the first-frame search for the second visitor wouldn't
+        exclude the just-bound first visitor.
+        """
+        with self._lock:
+            return set(self.known_bot_sort_ids.keys())
+
+    def visitor_ids_for_tracks(self, track_ids: Iterable[int]) -> set:
+        """Return the set of visitor_ids currently bound to the given
+        track_ids.
+
+        Used as the ``excluded_visitor_ids`` input to :meth:`search` —
+        when track A and track B are visible in the same frame, track B
+        is mathematically forbidden from matching whichever visitor_id
+        track A is already bound to. That guarantees two simultaneously-
+        visible people can never share a visitor_id / gallery.
+
+        Unknown track_ids (not yet bound) contribute nothing to the
+        exclusion set. The caller is expected to also be guarded by
+        the in-flight set so a single unknown track doesn't get
+        dispatched twice in parallel.
+        """
+        with self._lock:
+            out = set()
+            for tid in track_ids:
+                vid = self.known_bot_sort_ids.get(int(tid))
+                if vid is not None:
+                    out.add(int(vid))
+            return out
+
     # ── Daily lifecycle ──────────────────────────────────────────────────
 
     def reset(self) -> None:
-        """Wipe everything. Designed for the midnight cron."""
+        """Wipe everything. Designed for the 9 AM IST business-day cron."""
         with self._lock:
             self._face_index = faiss.IndexFlatIP(self._dim)
             self._face_row_to_visitor.clear()
             self._body_hists.clear()
             self._last_seen.clear()
-            self.known_bot_sort_ids.clear()
+            self._last_snapshot_at.clear()
+            self.known_bot_sort_ids.clear()   # dict.clear() — same call
             # Persist the empty state so a restart inside the same day
             # doesn't load yesterday's identity back in.
             self._save_to_disk_locked()
-        logger.info("DailyFaceCache reset — face index, body hists, and track set cleared")
+        logger.info(
+            "DailyFaceCache reset — face index, body hists, "
+            "snapshot timestamps, and track set cleared",
+        )
 
     # ── Persistence (caller MUST hold self._lock) ────────────────────────
 
@@ -350,7 +482,12 @@ class DailyFaceCache:
                     [h.copy() for h in lib] for lib in self._body_hists
                 ],
                 "last_seen_age": last_seen_age,
-                "known_bot_sort_ids": list(self.known_bot_sort_ids),
+                # Wall-clock per visitor — survives restart so the
+                # 10-min snapshot cooldown stays accurate.
+                "last_snapshot_at": list(self._last_snapshot_at),
+                # Dict in v2 (Dict[track_id → visitor_id]). Legacy
+                # files stored a list/set of ints — load handles both.
+                "known_bot_sort_ids": dict(self.known_bot_sort_ids),
             }
             dir_name = os.path.dirname(self._state_file) or "."
             os.makedirs(dir_name, exist_ok=True)
@@ -420,7 +557,28 @@ class DailyFaceCache:
             ages = [float(a) for a in data.get("last_seen_age", [])]
             now_mono = time.monotonic()
             self._last_seen = [now_mono - a for a in ages]
-            self.known_bot_sort_ids = {int(t) for t in data.get("known_bot_sort_ids", [])}
+            # Snapshot timestamps are wall-clock — load directly, no
+            # conversion needed. Pad to body-library length on legacy
+            # files that didn't track this field yet (so the cooldown
+            # check doesn't crash on missing entries).
+            stored_snaps = [float(t) for t in data.get("last_snapshot_at", [])]
+            self._last_snapshot_at = list(stored_snaps)
+            while len(self._last_snapshot_at) < len(self._body_hists):
+                self._last_snapshot_at.append(0.0)  # ancient → past cooldown
+            # Accept both the new dict format and the legacy
+            # list/set-of-track-ids format. Legacy entries lose their
+            # visitor binding (no longer recoverable), so they're
+            # effectively forgotten and will be reassigned on the
+            # next sighting — safe behavior.
+            raw_known = data.get("known_bot_sort_ids", {})
+            if isinstance(raw_known, dict):
+                self.known_bot_sort_ids = {
+                    int(k): int(v) for k, v in raw_known.items()
+                }
+            else:
+                # legacy list/set → can't recover the visitor binding;
+                # drop these so the new exclusion rule has clean inputs.
+                self.known_bot_sort_ids = {}
             logger.info(
                 "DailyFaceCache: restored %d visitor(s), %d face entries from %s",
                 len(self._body_hists), int(self._face_index.ntotal), self._state_file,
@@ -435,5 +593,6 @@ class DailyFaceCache:
             self._face_row_to_visitor = []
             self._body_hists = []
             self._last_seen = []
-            self.known_bot_sort_ids = set()
+            self._last_snapshot_at = []
+            self.known_bot_sort_ids = {}
             self._save_to_disk_locked()

@@ -42,10 +42,31 @@ DB_PATH: str = _abspath("DB_PATH", "snapshots.db")
 SNAPSHOT_DIR: str = _abspath("SNAPSHOT_DIR", "snapshots")
 ALERTS_DIR: str = _abspath("ALERTS_DIR", "alerts")
 LOG_FILE: str = _abspath("LOG_FILE", "visitor_log.txt")
-VISION_CONFIG_FILE: str = _abspath("VISION_CONFIG_FILE", "vision_config.json")
 
 # --- Vision ---
 ENTRY_ZONE: tuple = (0.1, 0.2, 0.9, 1.0)
+
+# --- Snapshot retention ---
+# How long to keep snapshot JPEGs + their DB rows before pruning. Two
+# limits combined: whichever hits first wins.
+#   SNAPSHOT_RETENTION_DAYS — anything older than this is deleted.
+#   SNAPSHOT_MAX_COUNT      — keep at most this many rows (newest first).
+# Override via env if you need different retention on a per-deploy basis.
+SNAPSHOT_RETENTION_DAYS: int = int(os.getenv("SNAPSHOT_RETENTION_DAYS", "7"))
+SNAPSHOT_MAX_COUNT: int = int(os.getenv("SNAPSHOT_MAX_COUNT", "2000"))
+
+# Per-visitor snapshot cooldown. After a visitor is first detected
+# we take a fresh snapshot every time this many seconds have elapsed
+# (subject to BoT-SORT track resets — same-track loiterers don't
+# trigger refresh snapshots). Greetings still fire only once per
+# business day per visitor regardless of cooldown.
+SNAPSHOT_COOLDOWN_SECONDS: int = int(os.getenv("SNAPSHOT_COOLDOWN_SECONDS", "600"))
+
+# --- Entry-zone polygon (greeting gate) ---
+# Coordinates inside this file are stored as NORMALIZED [0.0, 1.0] x/y
+# pairs so the same zone works regardless of the stream's actual pixel
+# resolution. Missing or empty polygon → default-allow (greet anywhere).
+ZONE_CONFIG_FILE: str = _abspath("ZONE_CONFIG_FILE", "zone_config.json")
 
 # --- Dashboard ---
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "5000"))

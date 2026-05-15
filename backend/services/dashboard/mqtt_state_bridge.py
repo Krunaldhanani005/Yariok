@@ -29,18 +29,19 @@ No shared mutable state is touched without a lock.
 from __future__ import annotations
 
 import base64
-import datetime
 import json
 import logging
 import os
+import queue
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import cv2
 import numpy as np
 
 from backend.config.settings import SNAPSHOT_DIR
+from backend.core.business_day import now_ist
 from backend.core.constants import (
     EV_VISITOR_DETECTED,
     MODE_KARAOKE,
@@ -91,6 +92,14 @@ class MqttStateBridge:
         self._sweeper: Optional[threading.Thread] = None
         self._prev_on_connect = None
         self._started: bool = False
+
+        # ── SSE subscriber registry ──────────────────────────────────────
+        # Each connected dashboard tab adds a Queue here via subscribe();
+        # every state mutation fans out a small dict to all queues.
+        # Dropped on full per-subscriber queue rather than blocking — a
+        # slow tab must never back up the paho network thread.
+        self._subscribers: List["queue.Queue[dict]"] = []
+        self._subscribers_lock: threading.Lock = threading.Lock()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -184,13 +193,19 @@ class MqttStateBridge:
             self._last_event_at = time.monotonic()
         if self._state.get("camera_status") != "Active":
             self._state.update(camera_status="Active")
+            self._broadcast("camera_status", camera_status="Active")
 
         event_type = payload.get("type")
-        if event_type == "new_visitor_detected":
+        # Phase C: VisionService emits ``visitor_snapshot`` for both
+        # first-sighting and refresh-snapshot events. The legacy name
+        # ``new_visitor_detected`` is still accepted so any in-flight
+        # MQTT message from an older producer at the moment of upgrade
+        # doesn't get dropped.
+        if event_type in ("visitor_snapshot", "new_visitor_detected"):
             try:
                 self._handle_new_visitor(payload)
             except Exception:
-                logger.exception("new_visitor_detected handler failed.")
+                logger.exception("visitor_snapshot handler failed.")
         elif event_type == "presence_update":
             try:
                 self._handle_presence_update(payload)
@@ -219,6 +234,9 @@ class MqttStateBridge:
         current = int(self._state.get("people_now", 0) or 0)
         if count != current:
             self._state.update(people_now=count)
+            # Push only on actual change — no need to spam every tick
+            # with identical people_now values.
+            self._broadcast("presence", people_now=count)
 
         # If people are visible, refresh the visitor timestamp so the
         # decay sweeper (now mostly a safety net) doesn't override us.
@@ -229,70 +247,112 @@ class MqttStateBridge:
     # ── Event handlers ───────────────────────────────────────────────────────
 
     def _handle_new_visitor(self, payload: dict) -> None:
-        """Mirror a single visitor event to state, DB, disk, and EventBus."""
+        """Mirror a single visitor-snapshot event to state, DB, disk, and EventBus.
+
+        Phase C semantics:
+
+          • ``is_first_sighting`` True  → this visitor is **new** for
+            today's business day. Increment ``visitors_today``; if
+            ``should_greet`` is True, fire the voice greeting.
+          • ``is_first_sighting`` False → this is a **refresh snapshot**
+            for a known visitor whose 10-minute cooldown elapsed. Bump
+            ``snapshots_taken`` only; do NOT increment ``visitors_today``
+            and never greet (we already greeted them today).
+        """
         track_id = payload.get("track_id")
         visitor_id = payload.get("visitor_id")
         image_b64: str = payload.get("image_base64", "") or ""
+        # Phase C defaults: keep old-format payloads working (everyone
+        # is a first-sighting that should be greeted unless silenced).
+        in_zone: bool = bool(payload.get("in_zone", True))
+        is_first_sighting: bool = bool(payload.get("is_first_sighting", True))
+        should_greet: bool = bool(payload.get("should_greet", is_first_sighting and in_zone))
 
         # ── Decode ONCE: the payload carries the full scene frame ────────
-        # We reuse it for: (a) saving the gallery snapshot file,
-        # (b) generating a small thumbnail for /api/status,
-        # (c) feeding the AI greeting handler on the EventBus.
         frame = self._decode_face_crop(image_b64)
-
-        # ── Generate a small thumbnail so /api/status doesn't ship the
-        #    full 200 KB scene on every dashboard poll. ──────────────────
         thumb_b64 = self._encode_thumbnail(frame) or image_b64
 
         # ── StateManager: counters + thumbnail + timestamps ──────────────
-        vnum = self._state.increment("visitors_today")
+        # ``snapshots_taken`` ALWAYS goes up (every event is a snapshot).
+        # ``visitors_today`` only goes up on first sighting — otherwise
+        # multiple refresh snapshots of the same person would inflate
+        # the unique-visitor count.
         self._state.increment("snapshots_taken")
+        if is_first_sighting:
+            vnum = self._state.increment("visitors_today")
+        else:
+            vnum = int(self._state.get("visitors_today", 0) or 0)
+
         self._state.update(
             people_now=max(int(self._state.get("people_now", 0) or 0), 1),
-            last_alert_time=datetime.datetime.now().strftime("%H:%M:%S"),
+            last_alert_time=now_ist().strftime("%H:%M:%S"),
             last_visitor_b64=thumb_b64,
         )
         with self._lock:
             self._last_visitor_at = time.monotonic()
 
         # ── Persist the FULL-FRAME snapshot file ─────────────────────────
-        # (side-effects layer — VisionService stays disk-free per Phase B).
         snapshot_filename = self._save_snapshot_file(frame)
         if snapshot_filename and self._db is not None:
             try:
-                self._db.save_snapshot(snapshot_filename, "Visitor")
+                self._db.save_snapshot(
+                    snapshot_filename,
+                    vtype="Visitor",
+                    visitor_id=visitor_id,
+                )
             except Exception:
                 logger.exception("DB save_snapshot failed for %s", snapshot_filename)
 
         # ── DB log (best-effort) ─────────────────────────────────────────
         if self._db is not None:
             try:
-                self._db.log_event(
-                    f"Visitor #{vnum} arrived (track={track_id})",
-                    "visitor",
-                    person_count=1,
+                msg = (
+                    f"Visitor #{vnum} arrived (track={track_id})"
+                    if is_first_sighting
+                    else f"Refresh snapshot for visitor #{visitor_id} (track={track_id})"
                 )
+                self._db.log_event(msg, "visitor", person_count=1)
             except Exception:
                 logger.exception("DB log_event failed for visitor #%s.", vnum)
 
-        # ── Republish on the internal EventBus ───────────────────────────
-        # AIService._on_visitor_detected(frame, visitor_num, mode) is
-        # already subscribed and triggers the TTS greeting.
+        # ── Republish on the internal EventBus only when greeting ────────
+        # AIService is the only consumer; firing only on should_greet
+        # avoids the LLM doing wasted work on refresh snapshots that
+        # we KNOW shouldn't speak. The AI service's own in_zone guard
+        # remains as a defensive second layer.
         mode = self._current_mode()
-        try:
-            self._bus.publish(
-                EV_VISITOR_DETECTED,
-                frame=frame,
-                visitor_num=vnum,
-                mode=mode,
-            )
-        except Exception:
-            logger.exception("EventBus publish of EV_VISITOR_DETECTED failed.")
+        if should_greet:
+            try:
+                self._bus.publish(
+                    EV_VISITOR_DETECTED,
+                    frame=frame,
+                    visitor_num=vnum,
+                    mode=mode,
+                    in_zone=in_zone,
+                )
+            except Exception:
+                logger.exception("EventBus publish of EV_VISITOR_DETECTED failed.")
 
         logger.info(
-            "Visitor #%d bridged — visitor_id=%s track=%s mode=%s scene=%d KB file=%s",
-            vnum, visitor_id, track_id, mode,
-            len(image_b64) // 1024, snapshot_filename or "<none>",
+            "Visitor bridged — id=%s first=%s greet=%s zone=%s "
+            "track=%s scene=%d KB file=%s",
+            visitor_id, is_first_sighting, should_greet, in_zone,
+            track_id, len(image_b64) // 1024, snapshot_filename or "<none>",
+        )
+
+        # ── SSE push: instant counter + thumbnail update for dashboards ─
+        # The thumbnail is included here (and only here) — presence
+        # ticks below stay small. Browser updates the counters and the
+        # last-visitor image the instant this message arrives.
+        self._broadcast(
+            "visitor",
+            visitors_today=vnum,
+            snapshots_taken=int(self._state.get("snapshots_taken", 0) or 0),
+            last_visitor_b64=thumb_b64,
+            last_alert_time=self._state.get("last_alert_time", "—"),
+            visitor_id=visitor_id,
+            track_id=track_id,
+            mode=mode,
         )
 
     # ── Snapshot persistence ─────────────────────────────────────────────
@@ -312,7 +372,7 @@ class MqttStateBridge:
             return None
         try:
             os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-            now = datetime.datetime.now()
+            now = now_ist()
             fname = now.strftime("visitor_%H%M%S.jpg")
             fpath = os.path.join(SNAPSHOT_DIR, fname)
             if os.path.exists(fpath):
@@ -361,6 +421,7 @@ class MqttStateBridge:
             status = self._derive_camera_status(now, last_event)
             if self._state.get("camera_status") != status:
                 self._state.update(camera_status=status)
+                self._broadcast("camera_status", camera_status=status)
 
     def _derive_camera_status(self, now: float, last_event: float) -> str:
         """Compute the current camera_status string for the dashboard."""
@@ -379,6 +440,57 @@ class MqttStateBridge:
             return bool(client.is_connected())
         except Exception:
             return False
+
+    # ── SSE subscriber API (consumed by /api/events) ─────────────────────
+
+    def subscribe(self) -> "queue.Queue[dict]":
+        """Register a dashboard tab as an SSE subscriber.
+
+        Returns a Queue; the route handler reads from it in a streaming
+        generator. The handler is responsible for calling
+        :meth:`unsubscribe` on connection close so we don't leak queues.
+
+        Per-subscriber maxsize=64: a tab that pauses (e.g. backgrounded)
+        for a few seconds doesn't lose state because we keep up to 64
+        pending events; beyond that we drop oldest events implicitly via
+        the bounded-queue + put_nowait pattern in :meth:`_broadcast`.
+        """
+        q: "queue.Queue[dict]" = queue.Queue(maxsize=64)
+        with self._subscribers_lock:
+            self._subscribers.append(q)
+        logger.debug("SSE subscriber added (total=%d)", len(self._subscribers))
+        return q
+
+    def unsubscribe(self, q: "queue.Queue[dict]") -> None:
+        """Remove a subscriber. Idempotent."""
+        with self._subscribers_lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+        logger.debug("SSE subscriber removed (total=%d)", len(self._subscribers))
+
+    def _broadcast(self, event_type: str, **fields) -> None:
+        """Fan out a state-change event to every connected SSE tab.
+
+        The payload shape is intentionally tiny — only the changed keys
+        — so a 1 Hz presence event costs a few hundred bytes per tab.
+        New-visitor events do carry the thumbnail but only on that single
+        message, never on the periodic presence ticks.
+
+        Drop semantics on a full queue: skip the slow consumer rather
+        than block. The dashboard's full /api/status remains the source
+        of truth on reconnect, so a few dropped delta events are
+        harmless.
+        """
+        msg = {"type": event_type, **fields}
+        with self._subscribers_lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                pass  # slow consumer — drop, don't block
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

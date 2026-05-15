@@ -28,8 +28,9 @@ import logging
 import os
 import tempfile
 import threading
-from datetime import date
 from typing import Any, Dict, Set
+
+from backend.core.business_day import current_business_day
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +146,20 @@ class StateManager:
             self._state["people_now"] = 0
             self._save_to_disk_locked()
         logger.info(
-            "StateManager: daily counters reset to 0 for %s",
-            date.today().isoformat(),
+            "StateManager: daily counters reset to 0 for business day %s",
+            current_business_day().isoformat(),
         )
 
     # ── Disk I/O (caller MUST hold self._lock) ─────────────────────────
 
     def _load_from_disk_locked(self) -> None:
-        """Restore today's persistent counters from disk if date matches."""
-        today = date.today().isoformat()
+        """Restore today's persistent counters from disk if BUSINESS-DAY matches.
+
+        Uses the 9-AM-IST business day rather than the calendar date so a
+        restart at 08:30 AM correctly hydrates yesterday's counters
+        (today's business day hasn't started yet).
+        """
+        today = current_business_day().isoformat()
         try:
             with open(self._state_file) as f:
                 data = json.load(f)
@@ -211,7 +217,7 @@ class StateManager:
         a disk error is preferable to taking down the vision pipeline.
         """
         payload = {
-            "date": date.today().isoformat(),
+            "date": current_business_day().isoformat(),
             **{k: int(self._state.get(k, 0)) for k in self._PERSISTENT_KEYS},
         }
         try:
