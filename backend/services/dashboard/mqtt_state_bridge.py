@@ -196,12 +196,27 @@ class MqttStateBridge:
             self._broadcast("camera_status", camera_status="Active")
 
         event_type = payload.get("type")
-        # Phase C: VisionService emits ``visitor_snapshot`` for both
-        # first-sighting and refresh-snapshot events. The legacy name
-        # ``new_visitor_detected`` is still accepted so any in-flight
-        # MQTT message from an older producer at the moment of upgrade
-        # doesn't get dropped.
-        if event_type in ("visitor_snapshot", "new_visitor_detected"):
+        # Phase C Sprint 1 split the visitor event in two:
+        #
+        #   visitor_announce — instant-greet event. Fires at the
+        #     first-sighting decision moment, before the snapshot
+        #     buffer resolves. Handler bumps visitors_today and
+        #     fires the voice greet via EventBus.
+        #
+        #   visitor_snapshot — fired after the SnapshotBuffer picks
+        #     the best frame. Handler does the disk write, the DB
+        #     row, and the thumbnail update. Never fires voice (the
+        #     announce already did).
+        #
+        # The legacy name ``new_visitor_detected`` is still accepted
+        # so any in-flight MQTT message from an older producer at the
+        # moment of upgrade doesn't get dropped.
+        if event_type == "visitor_announce":
+            try:
+                self._handle_visitor_announce(payload)
+            except Exception:
+                logger.exception("visitor_announce handler failed.")
+        elif event_type in ("visitor_snapshot", "new_visitor_detected"):
             try:
                 self._handle_new_visitor(payload)
             except Exception:
@@ -246,46 +261,114 @@ class MqttStateBridge:
 
     # ── Event handlers ───────────────────────────────────────────────────────
 
+    def _handle_visitor_announce(self, payload: dict) -> None:
+        """Instant-greet event — fires before the SnapshotBuffer resolves.
+
+        Phase C Sprint 1 split the old single ``visitor_snapshot`` event
+        into two so the voice greeting can fire instantly while the
+        gallery photo waits for the best frame. This handler owns:
+
+          • ``visitors_today`` increment (only here — not on snapshot)
+          • ``last_alert_time`` update
+          • EventBus :data:`EV_VISITOR_DETECTED` publish — fires voice
+
+        It does NOT save anything to disk or DB. The follow-up
+        ``visitor_snapshot`` event (handled in :meth:`_handle_new_visitor`)
+        owns persistence and the thumbnail update.
+
+        Refresh-snapshot events (cooldown + absent-duration both
+        elapsed for a known visitor) do NOT emit visitor_announce —
+        they only arrive at :meth:`_handle_new_visitor`.
+        """
+        visitor_id = payload.get("visitor_id")
+        track_id = payload.get("track_id")
+        image_b64: str = payload.get("image_base64", "") or ""
+        in_zone: bool = bool(payload.get("in_zone", True))
+        should_greet: bool = bool(payload.get("should_greet", in_zone))
+
+        # ── Counter + timestamp ──────────────────────────────────────────
+        # ``visitors_today`` is incremented exactly once per arrival —
+        # here, on announce. The snapshot event NEVER bumps this counter.
+        vnum = self._state.increment("visitors_today")
+        self._state.update(
+            people_now=max(int(self._state.get("people_now", 0) or 0), 1),
+            last_alert_time=now_ist().strftime("%H:%M:%S"),
+        )
+        with self._lock:
+            self._last_visitor_at = time.monotonic()
+
+        # ── Voice greet via EventBus ────────────────────────────────────
+        # AIService is the only consumer of EV_VISITOR_DETECTED. The
+        # frame here is the FIRST resolving frame (not the SnapshotBuffer's
+        # best one), accepted as the trade-off for instant voice. AI
+        # captioning uses this frame for scene context.
+        mode = self._current_mode()
+        if should_greet:
+            frame = self._decode_face_crop(image_b64) if image_b64 else None
+            try:
+                self._bus.publish(
+                    EV_VISITOR_DETECTED,
+                    frame=frame,
+                    visitor_num=vnum,
+                    mode=mode,
+                    in_zone=in_zone,
+                )
+            except Exception:
+                logger.exception("EventBus publish of EV_VISITOR_DETECTED failed.")
+
+        logger.info(
+            "Visitor announced — id=%s vnum=%d greet=%s zone=%s track=%s",
+            visitor_id, vnum, should_greet, in_zone, track_id,
+        )
+
+        # ── SSE push: instant counter update for dashboards ─────────────
+        # No thumbnail here — the snapshot event below pushes the
+        # SHARPEST frame, which is what we want browsers to display.
+        self._broadcast(
+            "visitor",
+            visitors_today=vnum,
+            last_alert_time=self._state.get("last_alert_time", "—"),
+            visitor_id=visitor_id,
+            track_id=track_id,
+            mode=mode,
+        )
+
     def _handle_new_visitor(self, payload: dict) -> None:
-        """Mirror a single visitor-snapshot event to state, DB, disk, and EventBus.
+        """Mirror a SnapshotBuffer-resolved snapshot to disk + DB + thumbnail.
 
-        Phase C semantics:
+        Phase C Sprint 1: this handler runs AFTER the buffer has picked
+        the sharpest frame for the visitor. The voice greet and the
+        ``visitors_today`` counter were already handled by the
+        ``visitor_announce`` event for first-sighting visitors. Refresh
+        snapshots skip announce and arrive only here.
 
-          • ``is_first_sighting`` True  → this visitor is **new** for
-            today's business day. Increment ``visitors_today``; if
-            ``should_greet`` is True, fire the voice greeting.
-          • ``is_first_sighting`` False → this is a **refresh snapshot**
-            for a known visitor whose 10-minute cooldown elapsed. Bump
-            ``snapshots_taken`` only; do NOT increment ``visitors_today``
-            and never greet (we already greeted them today).
+        Responsibilities:
+          • Always bump ``snapshots_taken``
+          • Persist the JPEG to disk + insert a DB row
+          • Update ``last_visitor_b64`` (the dashboard now shows the
+            BEST frame instead of the first resolving one)
+          • SSE push for live dashboard updates
+          • Never fire voice — announce already did
         """
         track_id = payload.get("track_id")
         visitor_id = payload.get("visitor_id")
         image_b64: str = payload.get("image_base64", "") or ""
-        # Phase C defaults: keep old-format payloads working (everyone
-        # is a first-sighting that should be greeted unless silenced).
-        in_zone: bool = bool(payload.get("in_zone", True))
         is_first_sighting: bool = bool(payload.get("is_first_sighting", True))
-        should_greet: bool = bool(payload.get("should_greet", is_first_sighting and in_zone))
 
         # ── Decode ONCE: the payload carries the full scene frame ────────
         frame = self._decode_face_crop(image_b64)
         thumb_b64 = self._encode_thumbnail(frame) or image_b64
 
-        # ── StateManager: counters + thumbnail + timestamps ──────────────
-        # ``snapshots_taken`` ALWAYS goes up (every event is a snapshot).
-        # ``visitors_today`` only goes up on first sighting — otherwise
-        # multiple refresh snapshots of the same person would inflate
-        # the unique-visitor count.
+        # ── Counters + thumbnail ─────────────────────────────────────────
+        # snapshots_taken ALWAYS goes up (every committed buffer event is
+        # a snapshot). visitors_today is NOT touched here — that lives
+        # exclusively on visitor_announce so first-sighting and refresh
+        # events can share this handler safely.
         self._state.increment("snapshots_taken")
-        if is_first_sighting:
-            vnum = self._state.increment("visitors_today")
-        else:
-            vnum = int(self._state.get("visitors_today", 0) or 0)
+        vnum = int(self._state.get("visitors_today", 0) or 0)
 
         self._state.update(
             people_now=max(int(self._state.get("people_now", 0) or 0), 1),
-            last_alert_time=now_ist().strftime("%H:%M:%S"),
             last_visitor_b64=thumb_b64,
         )
         with self._lock:
@@ -307,7 +390,7 @@ class MqttStateBridge:
         if self._db is not None:
             try:
                 msg = (
-                    f"Visitor #{vnum} arrived (track={track_id})"
+                    f"Snapshot saved for visitor #{vnum} (track={track_id})"
                     if is_first_sighting
                     else f"Refresh snapshot for visitor #{visitor_id} (track={track_id})"
                 )
@@ -315,35 +398,15 @@ class MqttStateBridge:
             except Exception:
                 logger.exception("DB log_event failed for visitor #%s.", vnum)
 
-        # ── Republish on the internal EventBus only when greeting ────────
-        # AIService is the only consumer; firing only on should_greet
-        # avoids the LLM doing wasted work on refresh snapshots that
-        # we KNOW shouldn't speak. The AI service's own in_zone guard
-        # remains as a defensive second layer.
-        mode = self._current_mode()
-        if should_greet:
-            try:
-                self._bus.publish(
-                    EV_VISITOR_DETECTED,
-                    frame=frame,
-                    visitor_num=vnum,
-                    mode=mode,
-                    in_zone=in_zone,
-                )
-            except Exception:
-                logger.exception("EventBus publish of EV_VISITOR_DETECTED failed.")
-
         logger.info(
-            "Visitor bridged — id=%s first=%s greet=%s zone=%s "
-            "track=%s scene=%d KB file=%s",
-            visitor_id, is_first_sighting, should_greet, in_zone,
-            track_id, len(image_b64) // 1024, snapshot_filename or "<none>",
+            "Snapshot bridged — id=%s first=%s vnum=%d track=%s scene=%d KB file=%s",
+            visitor_id, is_first_sighting, vnum, track_id,
+            len(image_b64) // 1024, snapshot_filename or "<none>",
         )
 
-        # ── SSE push: instant counter + thumbnail update for dashboards ─
-        # The thumbnail is included here (and only here) — presence
-        # ticks below stay small. Browser updates the counters and the
-        # last-visitor image the instant this message arrives.
+        # ── SSE push: thumbnail + snapshot counter update ────────────────
+        # The thumbnail is the SnapshotBuffer's best frame — browsers
+        # see the sharpest available shot of the visitor here.
         self._broadcast(
             "visitor",
             visitors_today=vnum,
@@ -352,7 +415,7 @@ class MqttStateBridge:
             last_alert_time=self._state.get("last_alert_time", "—"),
             visitor_id=visitor_id,
             track_id=track_id,
-            mode=mode,
+            mode=self._current_mode(),
         )
 
     # ── Snapshot persistence ─────────────────────────────────────────────

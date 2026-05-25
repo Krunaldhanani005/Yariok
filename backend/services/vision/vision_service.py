@@ -49,7 +49,9 @@ from backend.core.business_day import (
     now_ist,
     seconds_until_next_business_day_start,
 )
+from backend.services.vision.body_engine import BodyEngine
 from backend.services.vision.face_engine import DetectedFace, FaceEngine
+from backend.services.vision.snapshot_buffer import SnapshotBuffer
 from backend.services.vision.vector_store import DailyFaceCache
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,45 @@ STREAM_QUEUE_MAX: int = 5
 # so the dashboard's people_now stays honest even when no NEW face arrives.
 PRESENCE_PUBLISH_INTERVAL_SECONDS: float = 1.0
 
+# ── Sprint 1 — Snapshot quality + lurker spam fix ───────────────────────────
+#
+# SNAPSHOT_BUFFER_WINDOW_SECONDS (Issue #4): we hold the snapshot decision
+# open this long, scoring candidate frames by face_quality, before
+# committing the sharpest one. 2.5 s ≈ 15 frames at 6 FPS — enough to
+# catch a head turn or a clearer pass without delaying the photo
+# noticeably for the user.
+#
+# ABSENT_DURATION_REQUIRED_SECONDS (Issue #5): a known visitor whose
+# 10-minute snapshot cooldown has elapsed only qualifies for a refresh
+# snapshot if they were ALSO absent from the camera for at least this
+# many seconds. A stationary receptionist whose BoT-SORT track resets
+# every 10 minutes would otherwise generate one fresh snapshot per
+# cooldown window even though they never actually left.
+SNAPSHOT_BUFFER_WINDOW_SECONDS: float = 2.5
+ABSENT_DURATION_REQUIRED_SECONDS: float = 60.0
+
+# Spatial-IoU sibling threshold — BoT-SORT track-split false-split fix.
+#
+# Symptom: a single physical person occasionally has their BoT-SORT
+# track id flip from N to N+1 over consecutive frames. If the old
+# track is still in the SAME frame as the new one when YOLO emits
+# results, the co-occurrence exclusivity rule treats the new track
+# as "someone different from whoever the old track is bound to" —
+# and the new track is forbidden from re-matching the bound
+# visitor. Result: a false-split (one person becomes two visitor_ids).
+#
+# Detection: if the new unknown track's bbox overlaps a BOUND
+# track's bbox at IoU ≥ this threshold, the two are treated as the
+# same physical person (siblings). The bound track's visitor_id is
+# removed from the new track's co-visible exclusion set for that
+# one dispatch, so the new track is free to re-match the same
+# visitor via the normal body/face rules.
+#
+# 0.5 is conservative: two distinct people standing shoulder-to-
+# shoulder rarely produce bbox IoU > 0.3, and BoT-SORT track
+# splits typically produce IoU > 0.7. The middle is safe.
+SIBLING_IOU_THRESHOLD: float = 0.5
+
 
 # ── Internal work items ─────────────────────────────────────────────────────
 
@@ -106,12 +147,22 @@ class _FaceJob:
     view and forbids the new face/body from matching any of them —
     the "co-occurrence exclusivity" rule that makes simultaneous
     arrivals impossible to false-merge.
+
+    ``buffer_feed_for`` (Sprint 1 / Issue #4): when set, this job is
+    a LIGHTWEIGHT candidate for the SnapshotBuffer keyed by the
+    given visitor_id. The worker runs face detection + quality
+    scoring only — no identity search, no MQTT publish, no binding
+    work — and submits the result to the buffer. Used to keep
+    feeding frames into an open buffer for visitors whose track is
+    already bound (which would normally bypass the worker entirely
+    via Gate 1).
     """
     frame: np.ndarray
     track_id: int
     bbox: Tuple[float, float, float, float]
     is_in_zone: bool = True
     co_visible_track_ids: tuple = ()   # tuple[int, ...] — other tracks in same frame
+    buffer_feed_for: Optional[int] = None   # visitor_id, or None for normal identity work
 
 
 # ── Service ─────────────────────────────────────────────────────────────────
@@ -220,7 +271,21 @@ class VisionService:
 
         # ── Engines ──────────────────────────────────────────────────────
         self._face_engine: FaceEngine = FaceEngine(blur_threshold=blur_threshold)
+        # OSNet-x0_25 body re-ID — replaces the prior HSV-histogram path.
+        # Cheap to construct; weights load in :meth:`start` via initialize().
+        self._body_engine: BodyEngine = BodyEngine()
         self._face_cache: DailyFaceCache = DailyFaceCache(match_threshold=match_threshold)
+
+        # ── Snapshot buffer (Issue #4 — best-frame selection) ────────────
+        # When the pipeline decides a snapshot should be committed, the
+        # decision opens a buffer here instead of publishing immediately.
+        # Candidate frames feed the buffer over the configured window;
+        # the sharpest one is committed via the on_commit callback,
+        # which publishes the real ``visitor_snapshot`` MQTT event.
+        self._snapshot_buffer: SnapshotBuffer = SnapshotBuffer(
+            window_seconds=SNAPSHOT_BUFFER_WINDOW_SECONDS,
+            on_commit=self._commit_buffered_snapshot,
+        )
 
         # YOLO loaded in start(). MQTT client may already be injected;
         # if not, _connect_mqtt() will create one. Do NOT reset it here.
@@ -240,6 +305,15 @@ class VisionService:
             logger.warning(
                 "FaceEngine init failed — service will still run but no "
                 "embeddings will be published."
+            )
+        # BodyEngine loads OSNet weights. On failure the worker still
+        # runs face-only: every body_emb will be None, the search() will
+        # skip C2/C3, and identity decisions ride C1 alone. Degraded but
+        # not crashing — same posture as FaceEngine failure.
+        if not self._body_engine.initialize():
+            logger.warning(
+                "BodyEngine init failed — body re-ID disabled, falling "
+                "back to face-only identity."
             )
         # Only manage the MQTT connection when no external client was injected.
         if not self._mqtt_external:
@@ -330,6 +404,13 @@ class VisionService:
         the route handler's responsibility — this method only touches
         the in-memory state owned by VisionService.
         """
+        # Drain any pending snapshot buffers BEFORE wiping the
+        # identity cache. The on_commit callback only publishes MQTT
+        # — disk + DB persistence happens in the bridge, which is
+        # fine to receive the in-flight snapshot. If we wiped first
+        # the buffer would commit with stale visitor_ids that no
+        # longer map to anything in the cache.
+        self._snapshot_buffer.drain()
         self._face_cache.reset()
         with self._in_flight_lock:
             self._in_flight_track_ids.clear()
@@ -603,6 +684,24 @@ class VisionService:
         # Set of ALL track_ids currently visible in this frame.
         current_tids = {t for (t, _b, _z) in plausible}
 
+        # ── Identity bookkeeping for this frame ───────────────────────────
+        # One snapshot of the binding map drives THREE downstream things:
+        #   (1) the co-occurrence pool below,
+        #   (2) the per-frame ``touch_last_seen`` update (Issue #5),
+        #   (3) the buffer-feed dispatch decision inside Gate 1 (Issue #4).
+        # Taking the snapshot once under the cache's lock keeps all three
+        # consistent with each other even if the worker thread binds a
+        # new track mid-frame.
+        track_to_visitor = self._face_cache.track_to_visitor_snapshot()
+        visible_visitor_ids: set = {
+            track_to_visitor[t] for t in current_tids if t in track_to_visitor
+        }
+        # Touch last-seen for every visitor with a bound track in view.
+        # Drives the absent-duration guard so a stationary visitor's
+        # last_seen_wall never goes stale, preventing the cooldown from
+        # firing a "refresh" snapshot on a person who never left.
+        self._face_cache.touch_last_seen(visible_visitor_ids)
+
         # ── Recent-frames co-occurrence pool ──────────────────────────────
         # A track contributes to another track's co_visible exclusion
         # ONLY IF it qualifies as "trustworthy" by either:
@@ -617,16 +716,50 @@ class VisionService:
         #     guarantee: the moment track A is bound to visitor 0,
         #     track B's search excludes visitor 0 even on frame 1.
         stable_tids = current_tids & self._prev_frame_track_ids
-        bound_tids  = self._face_cache.known_track_ids_snapshot() & current_tids
+        bound_tids  = set(track_to_visitor.keys()) & current_tids
         co_visible_pool = stable_tids | bound_tids
+
+        # ── Sibling-IoU map (BoT-SORT track-split fix) ────────────────────
+        # Per-track bbox of every BOUND track in this frame, used by
+        # the Pass 2 dispatch to detect "the new unknown track is
+        # spatially the same blob as a bound track." When that
+        # happens, the bound track's visitor_id is removed from the
+        # new track's co-occurrence exclusion set — defeating the
+        # false-split where BoT-SORT spawns a fresh id for a person
+        # whose previous id hasn't dropped yet, and the rule treats
+        # them as different people.
+        bound_bbox_by_tid: dict = {
+            t: b for (t, b, _z) in plausible if t in track_to_visitor
+        }
 
         # ── Pass 2: draw boxes, gate, dispatch ───────────────────────────
         for track_id, bbox, is_in_zone in plausible:
             active_ids.append(track_id)
             self._draw_box(display, bbox, track_id)
 
-            # GATE 1 — already resolved today, skip face work entirely.
+            # GATE 1 — already resolved today, skip identity work.
+            # Buffer-feed exception (Issue #4): if this track's
+            # visitor has an OPEN snapshot buffer, dispatch a
+            # lightweight feed job so the buffer can compare this
+            # frame's face_quality. Otherwise this skip would starve
+            # the buffer of candidates — Gate 1 normally short-
+            # circuits known tracks before they ever reach the worker.
             if self._face_cache.is_track_known(track_id):
+                vid = track_to_visitor.get(track_id)
+                if vid is not None and self._snapshot_buffer.is_open(vid):
+                    try:
+                        self._face_queue.put_nowait(
+                            _FaceJob(
+                                frame=frame.copy(),
+                                track_id=track_id,
+                                bbox=bbox,
+                                buffer_feed_for=vid,
+                            )
+                        )
+                    except queue.Full:
+                        # Buffer already has at least the opener frame;
+                        # missing one feed candidate is harmless.
+                        pass
                 continue
 
             # GATE 1b — already enqueued and being evaluated.
@@ -635,10 +768,38 @@ class VisionService:
                     continue
                 self._in_flight_track_ids.add(track_id)
 
+            # ── Sibling-IoU exception (BoT-SORT track-split fix) ────────
+            # If this new unknown track sits at high spatial overlap
+            # with any BOUND track in the same frame, treat them as
+            # the SAME physical person (BoT-SORT split). Remove those
+            # bound tracks from THIS track's co-visible set so the
+            # worker is allowed to re-match the same visitor through
+            # the normal body/face rules.
+            sibling_tids: set = set()
+            for bt, bb in bound_bbox_by_tid.items():
+                if bt == track_id:
+                    continue
+                if self._bbox_iou(bbox, bb) >= SIBLING_IOU_THRESHOLD:
+                    sibling_tids.add(bt)
+            if sibling_tids:
+                sibling_vids = {
+                    track_to_visitor[t] for t in sibling_tids
+                    if t in track_to_visitor
+                }
+                logger.info(
+                    "Sibling-IoU exception — new track_id=%d overlaps bound "
+                    "tracks %s (visitors %s) — exclusion suspended for this dispatch",
+                    track_id, sorted(sibling_tids), sorted(sibling_vids),
+                )
+
             # Co-occurrence exclusivity: every OTHER trustworthy track
-            # in the pool is forbidden from sharing this job's visitor_id.
+            # in the pool is forbidden from sharing this job's visitor_id,
+            # EXCEPT siblings (BoT-SORT splits of the same person).
             # Cast to tuple so the _FaceJob is hashable / picklable.
-            co_visible = tuple(t for t in co_visible_pool if t != track_id)
+            co_visible = tuple(
+                t for t in co_visible_pool
+                if t != track_id and t not in sibling_tids
+            )
 
             try:
                 self._face_queue.put_nowait(
@@ -659,6 +820,24 @@ class VisionService:
                     "Face queue full — dropping track_id=%d (will retry next frame)",
                     track_id,
                 )
+
+        # ── SnapshotBuffer tick (Issue #4) ─────────────────────────────
+        # Two commit paths fire from the inference thread at ~6 Hz:
+        #
+        #   • commit_for_orphaned_visitors — anyone with an OPEN buffer
+        #     whose visitor has no alive bound track in this frame.
+        #     "Track lost" semantics from the spec: commit early
+        #     rather than wait the full window on someone who left.
+        #     Conservative: a BoT-SORT track reset that spawns a new
+        #     id for the SAME visitor keeps the buffer open across
+        #     the transition (the new track binds → visitor stays in
+        #     ``visible_visitor_ids`` → not orphaned).
+        #
+        #   • commit_expired — anyone whose 2.5 s window elapsed,
+        #     regardless of visibility. The hard deadline guarantees
+        #     a snapshot eventually lands even for very brief visits.
+        self._snapshot_buffer.commit_for_orphaned_visitors(visible_visitor_ids)
+        self._snapshot_buffer.commit_expired()
 
         # Roll the previous-frame set forward so the next call's
         # stability check has accurate data. The set tracks ALL
@@ -726,7 +905,12 @@ class VisionService:
     def _handle_face_job(self, job: _FaceJob) -> None:
         """Run the hybrid identity pipeline for one (track_id, bbox) pair.
 
-        Pipeline (Phase B v2 — hybrid body + face):
+        Pipeline (Phase C Sprint 1 — buffered snapshot, split events):
+
+            Buffer-feed shortcut (Issue #4): if ``buffer_feed_for`` is
+                set, this is a lightweight candidate for an already-open
+                SnapshotBuffer. Score the face_quality and submit; no
+                identity work, no MQTT publish, no binding mutation.
 
             Gate 1  : Track-id already in known set?  → bail (camera thread)
             Gate 1b : Re-check under the worker       → bail
@@ -736,20 +920,49 @@ class VisionService:
                        - body match wins immediately (clothing color)
                        - else face match wins
                        - else: brand-new visitor
-            Snapshot: ONE per visitor per day — full frame, not face crop
 
-        Why both signals: CCTV faces are tiny / off-axis / occluded ~80%
-        of the time. Face-only re-ID misses re-acquisitions across track
-        resets, causing duplicate snapshots and duplicate greetings.
-        Clothing color works on every frame and catches those cases.
+            Decision (refresh path): the 10-min cooldown is necessary
+                but no longer sufficient. The visitor must ALSO have
+                been absent (no bound track in view) for
+                ABSENT_DURATION_REQUIRED_SECONDS — the Issue #5
+                "lurker spam fix".
+
+            Emit (first sighting): publish ``visitor_announce`` INSTANTLY
+                (fires voice + visitors_today counter via the bridge)
+                and OPEN a SnapshotBuffer. The real ``visitor_snapshot``
+                event fires later when the buffer commits the sharpest
+                frame.
+
+            Emit (refresh): no announce (no greet, no counter bump);
+                open the SnapshotBuffer directly.
         """
+        # ── Buffer-feed shortcut (Issue #4) ──────────────────────────
+        # Lightweight job for known tracks whose visitor has an open
+        # snapshot buffer. Compute face_quality only — no identity
+        # search, no binding, no MQTT.
+        if job.buffer_feed_for is not None:
+            vid = int(job.buffer_feed_for)
+            if not self._snapshot_buffer.is_open(vid):
+                return
+            face_quality = 0.0
+            detected = self._face_engine.get_face(job.frame, job.bbox)
+            if detected is not None:
+                face_quality = self._face_engine.check_quality(detected.crop)
+            self._snapshot_buffer.submit(vid, job.frame, face_quality)
+            return
+
         # ── Gate 1b: re-check under the worker ───────────────────────
         if self._face_cache.is_track_known(job.track_id):
             return
 
-        # ── Gate 2: body histogram (always available) ────────────────
-        body_hist = self._face_engine.compute_body_histogram(job.frame, job.bbox)
-        if body_hist is None:
+        # ── Gate 2: body embedding (OSNet, always available when ready) ──
+        # If BodyEngine failed to initialize, compute_body_embedding
+        # returns None and we proceed face-only (search() naturally
+        # skips C2/C3 when body_emb is None). If BodyEngine IS ready
+        # but the crop is degenerate (zero-area, sub-resolution torso),
+        # we still bail — same contract as the old HSV path.
+        body_emb = self._body_engine.compute_body_embedding(job.frame, job.bbox)
+        if body_emb is None and self._body_engine.is_ready:
             return  # zero-area crop, can't proceed
 
         # ── Gate 3: face (optional, may be None) ─────────────────────
@@ -775,7 +988,7 @@ class VisionService:
         )
         match = self._face_cache.search(
             face_embedding=face_emb,
-            body_hist=body_hist,
+            body_emb=body_emb,
             excluded_visitor_ids=excluded_vids,
         )
 
@@ -787,31 +1000,42 @@ class VisionService:
         #               be added below if we have a face. Greet fires
         #               (subject to zone). Snapshot is unconditional.
         #       False → known visitor on a new BoT-SORT track id. No
-        #               greet ever. Snapshot only if cooldown elapsed.
-        #
-        #   should_snapshot, should_greet
-        #       Per spec:
-        #         should_snapshot = is_first_sighting OR cooldown_elapsed
-        #         should_greet    = is_first_sighting AND in_zone
+        #               greet ever. Snapshot only if cooldown elapsed
+        #               AND the absent-duration guard (Issue #5) is
+        #               satisfied.
         is_first_sighting = not match.matched
 
         if not is_first_sighting:
-            # Known visitor — silent re-ID for everything except the
-            # 10-minute refresh-snapshot path.
             visitor_id = int(match.index)
-            self._face_cache.mark_track_known(job.track_id, visitor_id)
+            # Read both timers BEFORE binding this new track. The
+            # binding causes the next inference frame to call
+            # ``touch_last_seen`` for this visitor — washing out the
+            # absence window we need to measure here.
             time_since_snap = self._face_cache.time_since_snapshot(visitor_id)
-            should_snapshot = time_since_snap >= SNAPSHOT_COOLDOWN_SECONDS
+            time_since_seen = self._face_cache.time_since_last_seen(visitor_id)
+            self._face_cache.mark_track_known(job.track_id, visitor_id)
+
+            cooldown_elapsed = time_since_snap >= SNAPSHOT_COOLDOWN_SECONDS
+            absent_long_enough = time_since_seen >= ABSENT_DURATION_REQUIRED_SECONDS
+            should_snapshot = cooldown_elapsed and absent_long_enough
             should_greet = False
+
             if not should_snapshot:
+                reason = (
+                    "within-cooldown" if not cooldown_elapsed
+                    else "lurker-still-present"
+                )
                 logger.info(
                     "Re-identified via %s on new track_id=%d (sim=%.3f → "
-                    "visitor #%d) — within %ds cooldown, no refresh snapshot",
+                    "visitor #%d) — silent (%s: cooldown=%.0fs absent=%.0fs)",
                     match.kind, job.track_id, match.score, visitor_id,
-                    SNAPSHOT_COOLDOWN_SECONDS,
+                    reason, time_since_snap, time_since_seen,
                 )
                 return
-            # Cooldown elapsed → take a refresh snapshot, no greet.
+            # Both gates passed → eligible for a refresh snapshot. Stamp
+            # the cooldown NOW so concurrent worker jobs for the same
+            # visitor don't all open buffers; only the first one through
+            # will see the cooldown reset.
             self._face_cache.mark_snapshot(visitor_id)
         else:
             # No match. We still REQUIRE a face to confirm "brand new
@@ -826,46 +1050,133 @@ class VisionService:
                 )
                 return
             visitor_id = self._face_cache.add_visitor(
-                face_embedding=face_emb, body_hist=body_hist,
+                face_embedding=face_emb, body_emb=body_emb,
             )
             self._face_cache.mark_track_known(job.track_id, visitor_id)
             should_snapshot = True
             should_greet = bool(job.is_in_zone)
             time_since_snap = 0.0  # just registered → freshly stamped
 
-        # If we got here, ``should_snapshot`` is True.
-        # Snapshot = the FULL frame (CCTV scene), not the face crop.
-        image_b64 = self._encode_snapshot_base64(job.frame)
-
-        payload = {
-            "type": "visitor_snapshot",     # renamed: now covers refresh too
-            "visitor_id": int(visitor_id),
-            "track_id": int(job.track_id),
-            "image_base64": image_b64,           # ← full frame JPEG, base64
-            "is_first_sighting": is_first_sighting,
-            "should_greet": should_greet,
-            "in_zone": bool(job.is_in_zone),
-            "has_face": face_emb is not None,
-            "face_quality": round(face_quality, 2),
-            # IST wall-clock ISO timestamp — single source of truth.
-            "timestamp": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        self._publish_event(payload)
+        # If we got here, ``should_snapshot`` is True. Two emissions:
+        #
+        # 1. visitor_announce (INSTANT, first-sighting only) — drives
+        #    the voice greet and the visitors_today counter. Includes
+        #    a JPEG of the current frame so the AI service has scene
+        #    context for its captioning; encoding cost is paid here
+        #    on the worker thread, not on the camera thread.
+        #
+        # 2. visitor_snapshot (DELAYED via SnapshotBuffer) — drives
+        #    snapshots_taken, disk write, DB row, and the dashboard
+        #    thumbnail. Fires from the on_commit callback when the
+        #    buffer picks the sharpest frame. NEVER fires voice
+        #    (announce already did).
+        ist_ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
 
         if is_first_sighting:
+            self._publish_event({
+                "type": "visitor_announce",
+                "visitor_id": int(visitor_id),
+                "track_id": int(job.track_id),
+                "is_first_sighting": True,
+                "should_greet": should_greet,
+                "in_zone": bool(job.is_in_zone),
+                "has_face": face_emb is not None,
+                "face_quality": round(face_quality, 2),
+                "image_base64": self._encode_snapshot_base64(job.frame),
+                "timestamp": ist_ts,
+            })
+
+        payload_template = {
+            "type": "visitor_snapshot",
+            "visitor_id": int(visitor_id),
+            "track_id": int(job.track_id),
+            "is_first_sighting": is_first_sighting,
+            # Voice has already fired via visitor_announce (or this is a
+            # refresh, which never greets). The bridge ignores this
+            # field on visitor_snapshot, but keep it explicit for any
+            # downstream consumer that reads it.
+            "should_greet": False,
+            "in_zone": bool(job.is_in_zone),
+            "timestamp": ist_ts,
+        }
+
+        self._snapshot_buffer.open(
+            visitor_id=visitor_id,
+            track_id=job.track_id,
+            frame=job.frame,
+            face_quality=face_quality,
+            payload_template=payload_template,
+        )
+
+        if is_first_sighting:
+            # Diagnostic: top per-visitor (body, face) tuples for the
+            # near-miss candidates. Lets us see whether the match
+            # missed because no SINGLE visitor cleared both rule bars
+            # at the same time (versus best_body / best_face above
+            # which are score-maxes across DIFFERENT visitors and
+            # therefore can be misleading when tuning thresholds).
+            cand_str = ", ".join(
+                f"#{vid}(b={b:.3f},f={f:.3f})"
+                for vid, b, f in match.top_candidates
+            ) or "<none>"
             logger.info(
                 "NEW visitor #%d — track_id=%d has_face=%s face_quality=%.1f "
-                "in_zone=%s should_greet=%s (best_body=%.3f best_face=%.3f via=%s)",
+                "in_zone=%s should_greet=%s (best_body=%.3f best_face=%.3f via=%s) "
+                "→ announce fired, snapshot buffered for %.1fs | "
+                "top candidates: %s",
                 visitor_id, job.track_id, face_emb is not None, face_quality,
                 "YES" if job.is_in_zone else "no",
                 "YES" if should_greet else "no",
                 match.body_score, match.face_score, match.kind,
+                SNAPSHOT_BUFFER_WINDOW_SECONDS,
+                cand_str,
             )
         else:
             logger.info(
-                "Refresh snapshot for visitor #%d — track_id=%d "
+                "Refresh snapshot buffered for visitor #%d — track_id=%d "
                 "(via=%s sim=%.3f, %.0fs since last snapshot)",
                 visitor_id, job.track_id, match.kind, match.score, time_since_snap,
+            )
+
+    # ── Snapshot-buffer commit callback (Issue #4) ───────────────────────
+
+    def _commit_buffered_snapshot(
+        self,
+        payload_template: dict,
+        best_frame: np.ndarray,
+        best_quality: float,
+    ) -> None:
+        """SnapshotBuffer.on_commit — JPEG-encode the best frame and publish.
+
+        Called from the inference thread (via ``commit_expired`` or
+        ``commit_for_orphaned_visitors``) and from any thread that
+        triggers ``drain`` (factory_reset, business-day rollover).
+        JPEG encoding happens here, not at decision time, so the
+        encoding cost is paid exactly once for the chosen frame
+        rather than on every candidate that the buffer rejected.
+
+        Failures are logged and swallowed — the visitor_announce
+        event has already fired, so there's nothing to roll back; we
+        just lose the gallery photo for that one event, which the
+        bridge handles gracefully (no file written, no DB row).
+        """
+        try:
+            image_b64 = self._encode_snapshot_base64(best_frame)
+            payload = dict(payload_template)
+            payload["image_base64"] = image_b64
+            payload["has_face"] = best_quality > 0.0
+            payload["face_quality"] = round(float(best_quality), 2)
+            self._publish_event(payload)
+            logger.info(
+                "Snapshot committed — visitor #%s track=%s first=%s "
+                "best_face_quality=%.1f",
+                payload.get("visitor_id"), payload.get("track_id"),
+                payload.get("is_first_sighting"), best_quality,
+            )
+        except Exception:
+            logger.exception(
+                "_commit_buffered_snapshot failed for visitor=%s",
+                payload_template.get("visitor_id"),
             )
 
     # ── Streaming helpers ────────────────────────────────────────────────
@@ -901,6 +1212,35 @@ class VisionService:
                 self._stream_queue.put_nowait(jpeg_bytes)
             except queue.Full:
                 pass
+
+    @staticmethod
+    def _bbox_iou(
+        a: Tuple[float, float, float, float],
+        b: Tuple[float, float, float, float],
+    ) -> float:
+        """Intersection-over-Union of two axis-aligned bboxes (xyxy).
+
+        Returns 0.0 for non-overlapping pairs or degenerate (zero-area)
+        inputs. Used by Pass 2 to detect BoT-SORT track splits: two
+        boxes at IoU ≥ SIBLING_IOU_THRESHOLD are treated as the same
+        physical person and the co-occurrence exclusion is suspended
+        for that pair.
+        """
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        a_area = max(0.0, (ax2 - ax1) * (ay2 - ay1))
+        b_area = max(0.0, (bx2 - bx1) * (by2 - by1))
+        union = a_area + b_area - inter
+        return inter / union if union > 0.0 else 0.0
 
     @staticmethod
     def _draw_box(
@@ -1055,6 +1395,9 @@ class VisionService:
                 slept += step
             if self._stop_event.is_set():
                 return
+            # Drain pending snapshot buffers first so we don't commit
+            # photos for visitor_ids that the reset is about to delete.
+            self._snapshot_buffer.drain()
             self._face_cache.reset()
             logger.info(
                 "Business-day rollover (09:00 IST) — daily identity cache cleared.",

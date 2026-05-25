@@ -95,6 +95,15 @@ def api_snapshots_daywise():
             visitors.sort(key=lambda v: v["last_seen"], reverse=True)
             grouped[date] = {"visitors": visitors, "ungrouped": day["ungrouped"]}
 
+        # Explicit newest-first ordering. Python dicts preserve insertion
+        # order, and our DESC SQL ordering above usually gets this right
+        # — but Flask 3.x defaults to sort_keys=True in its JSON provider
+        # (which alphabetizes "2026-05-15" before "2026-05-18"). We
+        # disabled that globally in create_app, AND we explicitly re-
+        # sort here so the API contract is robust to future JSON-
+        # provider changes.
+        grouped = {d: grouped[d] for d in sorted(grouped.keys(), reverse=True)}
+
         return jsonify({
             "grouped": grouped,
             # The UI labels "Today" against the BUSINESS day, not the

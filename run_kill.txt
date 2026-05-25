@@ -1,0 +1,35 @@
+Stop everything (Yaariok + any background processes it spawned)
+
+# kill main + anything matching yaariok
+pkill -KILL -f 'backend/main.py'
+pkill -KILL -f 'yaariok'
+
+# free port 5001 if still held
+fuser -k 5001/tcp 2>/dev/null
+
+# verify nothing left
+ps -ef | grep -E 'backend/main.py|yaariok' | grep -v grep
+If the last line returns NOTHING, the system is fully stopped.
+
+
+
+
+
+
+
+
+
+
+Run the project
+Foreground (live logs in terminal, Ctrl+C to stop):
+
+
+cd /home/krunal/Documents/Yaariok
+DASHBOARD_PORT=5001 venv/bin/python backend/main.py
+Background (logs to file, terminal free):
+
+
+cd /home/krunal/Documents/Yaariok
+DASHBOARD_PORT=5001 venv/bin/python backend/main.py > logs/run.out 2>&1 &
+echo "PID $!"
+Dashboard will be at: http://localhost:5001

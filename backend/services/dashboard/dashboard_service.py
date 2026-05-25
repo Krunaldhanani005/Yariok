@@ -26,6 +26,15 @@ def create_app(registry) -> Flask:
     )
     app.config["registry"] = registry
 
+    # Flask 3.x's DefaultJSONProvider sets sort_keys=True, which
+    # alphabetically reorders dict keys on serialization. That breaks
+    # any endpoint that returns a dict whose key order is semantic —
+    # e.g. /api/snapshots/daywise, where we want today's date first
+    # and previous days following. Disable it globally; routes that
+    # need specific ordering can rely on Python's dict insertion
+    # ordering.
+    app.json.sort_keys = False
+
     # Register all route blueprints
     from backend.api.routes.control import bp as control_bp
     from backend.api.routes.snapshots import bp as snapshots_bp
